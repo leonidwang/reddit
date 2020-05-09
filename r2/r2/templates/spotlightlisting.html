@@ -16,19 +16,25 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
 <%namespace file="printablebuttons.html" import="ynbutton"/>
-<%namespace file="utils.html" import="tags, text_with_links"/>
+<%namespace file="utils.html" import="tags, text_with_links, classes"/>
 <%
    import json
-   from r2.lib.template_helpers import static
+   from r2.lib.template_helpers import static, format_html
    from r2.lib.wrapped import Templated
 %>
 
-<div id="siteTable_organic" class="organic-listing loading">
+<%!
+   from babel.numbers import format_currency
+%>
+
+<div id="siteTable_organic" ${classes('organic-listing', 'loading',
+    'show-placeholder' if thing.show_placeholder else None,
+  )}>
   %if thing.things:
     %for link in thing.things:
       ${unsafe(link.render(display=False))}
@@ -41,11 +47,13 @@
     </div>
   %endif
 
-  <div class="nextprev">
-    <div class="throbber"></div>
-    <button class="arrow prev">${_("prev")}</button>
-    <button class="arrow next">${_("next")}</button>
-  </div>
+  %if thing.navigable:
+    <div class="nextprev">
+      <div class="throbber"></div>
+      <button class="arrow prev">${_("prev")}</button>
+      <button class="arrow next">${_("next")}</button>
+    </div>
+  %endif
 
   <div class="help help-hoverable">
     ${_("what's this?")}
@@ -54,13 +62,13 @@
         <p>
           ${text_with_links(
             _("This sponsored link is an advertisement generated with our %(self_serve_advertisement_tool)s."),
-              self_serve_advertisement_tool=dict(link_text=_("self-serve advertisement tool"), path="http://www.reddit.com/wiki/selfservicepromotion")
+              self_serve_advertisement_tool=dict(link_text=_("self-serve advertisement tool"), path="https://www.reddit.com/wiki/selfserve")
           )}
         </p>
         <p>
           ${text_with_links(
-            _("Use of this tool is open to all members of reddit.com, and for as little as $20 you can advertise in this area. %(get_started)s"),
-              get_started=dict(link_text=unsafe(_("Get started &rsaquo;")), path="/ad_inq")
+            _("Use of this tool is open to all members of reddit.com, and for as little as %(price)s you can advertise in this area. %%(get_started)s") % dict(price=format_currency(g.min_total_budget_pennies / 100., 'USD', locale=c.locale)),
+              get_started=dict(link_text=format_html("%s &rsaquo;", _("Get started")), path="/advertising")
           )}
         </p>
       </div>
@@ -92,9 +100,10 @@
 </div>
 <script>
   r.spotlight.setup(
-    ${unsafe(json.dumps(thing.links))},
+    ${unsafe(json.dumps([link._fullname for link in thing.things]))},
     ${unsafe(json.dumps(thing.interestbar_prob))},
-    ${unsafe(json.dumps(thing.promotion_prob))}
+    ${unsafe(json.dumps(thing.show_promo))},
+    ${unsafe(json.dumps(thing.keywords))}
   )
 </script>
 

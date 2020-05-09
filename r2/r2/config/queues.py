@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -73,24 +73,24 @@ class MessageQueue(object):
 
 def declare_queues(g):
     queues = Queues({
-        "scraper_q": MessageQueue(),
+        "scraper_q": MessageQueue(bind_to_self=True),
         "newcomments_q": MessageQueue(),
         "commentstree_q": MessageQueue(bind_to_self=True),
         "commentstree_fastlane_q": MessageQueue(bind_to_self=True),
         "vote_link_q": MessageQueue(bind_to_self=True),
         "vote_comment_q": MessageQueue(bind_to_self=True),
-        "vote_fastlane_q": MessageQueue(bind_to_self=True),
-        "log_q": MessageQueue(bind_to_self=True),
         "cloudsearch_changes": MessageQueue(bind_to_self=True),
-        "update_promos_q": MessageQueue(bind_to_self=True),
         "butler_q": MessageQueue(),
+        "markread_q": MessageQueue(),
+        "del_account_q": MessageQueue(),
+        "automoderator_q": MessageQueue(),
+        "event_collector": MessageQueue(bind_to_self=True),
+        "event_collector_failed": MessageQueue(bind_to_self=True),
+        "modmail_email_q": MessageQueue(bind_to_self=True),
+        "author_query_q": MessageQueue(bind_to_self=True),
+        "subreddit_query_q": MessageQueue(bind_to_self=True),
+        "domain_query_q": MessageQueue(bind_to_self=True),
     })
-
-    if g.shard_link_vote_queues:
-        sharded_vote_queues = {"vote_link_%d_q" % i :
-                               MessageQueue(bind_to_self=True)
-                               for i in xrange(10)}
-        queues.declare(sharded_vote_queues)
 
     if g.shard_commentstree_queues:
         sharded_commentstree_queues = {"commentstree_%d_q" % i :
@@ -98,9 +98,43 @@ def declare_queues(g):
                                        for i in xrange(10)}
         queues.declare(sharded_commentstree_queues)
 
+    if g.shard_author_query_queues:
+        sharded_author_query_queues = {
+            "author_query_%d_q" % i: MessageQueue(bind_to_self=True)
+            for i in xrange(10)
+        }
+        queues.declare(sharded_author_query_queues)
+
+    if g.shard_subreddit_query_queues:
+        sharded_subreddit_query_queues = {
+            "subreddit_query_%d_q" % i: MessageQueue(bind_to_self=True)
+            for i in xrange(10)
+        }
+        queues.declare(sharded_subreddit_query_queues)
+
+    if g.shard_domain_query_queues:
+        sharded_domain_query_queues = {
+            "domain_query_%d_q" % i: MessageQueue(bind_to_self=True)
+            for i in xrange(10)
+        }
+        queues.declare(sharded_domain_query_queues)
+
     queues.cloudsearch_changes << "search_changes"
-    queues.scraper_q << "new_link"
+    queues.scraper_q << ("new_link", "link_text_edited")
     queues.newcomments_q << "new_comment"
     queues.butler_q << ("new_comment",
-                        "usertext_edited")
+                        "comment_text_edited")
+    queues.markread_q << "mark_all_read"
+    queues.del_account_q << "account_deleted"
+    queues.automoderator_q << (
+        "auto_removed",
+        "new_link",
+        "new_comment",
+        "new_media_embed",
+        "new_report",
+        "link_text_edited",
+        "comment_text_edited",
+    )
+    queues.event_collector << "event_collector_test"
+
     return queues

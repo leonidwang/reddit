@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -91,6 +91,7 @@
       <td>
         <input type="text" name="imgurl" value="${imgurl}" />
         ${error_field("NO_TEXT", "imgurl", "span")}
+        ${error_field("BAD_URL", "imgurl", "span")}
       </td>
     </tr>
   </table>

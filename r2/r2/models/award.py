@@ -16,22 +16,28 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from r2.lib.db.thing import Thing, Relation, NotFound
-from r2.lib.db.userrel import UserRel
+from pylons import app_globals as g
+
 from r2.lib.db.operators import asc, desc, lower
+from r2.lib.db.thing import Thing, Relation, NotFound
 from r2.lib.memoize import memoize
 from r2.models import Account
-from pylons import c, g, request
 
-class Award (Thing):
+
+class Award(Thing):
+    _cache = g.thingcache
     _defaults = dict(
-        awardtype = 'regular',
-        api_ok = False
-        )
+        awardtype='regular',
+        api_ok=False,
+    )
+
+    @classmethod
+    def _cache_prefix(cls):
+        return "award:"
 
     @classmethod
     @memoize('award.all_awards')
@@ -66,7 +72,7 @@ class Award (Thing):
 
     @classmethod
     def give_if_needed(cls, codename, user,
-                       description=None, url=None, cup_info=None):
+                       description=None, url=None):
         """Give an award to a user, unless they already have it.
            Returns the trophy. Does nothing and prints nothing
            (except for g.log.debug) if the award doesn't exist."""
@@ -86,7 +92,7 @@ class Award (Thing):
 
         g.log.debug("Gave %s to %s" % (codename, user))
         return Trophy._new(user, award, description=description,
-                        url=url, cup_info=cup_info)
+                        url=url)
 
     @classmethod
     def take_away(cls, codename, user):
@@ -117,31 +123,32 @@ class Award (Thing):
         else:
             g.log.debug("%s didn't have %s" % (user, codename))
 
+
 class FakeTrophy(object):
-    def __init__(self, recipient, award, description=None, url=None,
-                 cup_info=None):
+    def __init__(self, recipient, award, description=None, url=None):
         self._thing2 = award
         self._thing1 = recipient
         self.description = description
         self.url = url
         self.trophy_url = getattr(self, "url",
                                   getattr(self._thing2, "url", None))
-        self.cup_info = cup_info
         self._id = self._id36 = None
 
+
 class Trophy(Relation(Account, Award)):
+    _cache = g.thingcache
+    _enable_fast_query = False
+
     @classmethod
-    def _new(cls, recipient, award, description = None,
-             url = None, cup_info = None):
+    def _cache_prefix(cls):
+        return "trophy:"
 
-        # The "name" column of the relation can't be a constant or else a
+    @classmethod
+    def _new(cls, recipient, award, description=None, url=None):
+        # The "name" column of the Relation can't be a constant or else a
         # given account would not be allowed to win a given award more than
-        # once. So we're setting it to the string form of the timestamp.
-        # Still, we won't have that date just yet, so for a moment we're
-        # setting it to "trophy".
-
-        t = Trophy(recipient, award, "trophy")
-
+        # once.
+        t = Trophy(recipient, award, name="trophy")
         t._name = str(t._date)
 
         if description:
@@ -149,9 +156,6 @@ class Trophy(Relation(Account, Award)):
 
         if url:
             t.url = url
-
-        if cup_info:
-            recipient.set_cup(cup_info)
 
         t._commit()
         t.update_caches()
@@ -173,7 +177,7 @@ class Trophy(Relation(Account, Award)):
     def by_account(cls, account, _update=False):
         rel_ids = cls.by_account_cache(account._id, _update=_update)
         trophies = Trophy._byID_rel(rel_ids, data=True, eager_load=True,
-                                    thing_data=True, return_dict = False)
+            thing_data=True, return_dict=False, ignore_missing=True)
         return trophies
 
     @classmethod

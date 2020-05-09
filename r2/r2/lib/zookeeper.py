@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -24,12 +24,14 @@ import os
 import json
 import urllib
 import functools
-from collections import MutableMapping
+import zlib
 
 from kazoo.client import KazooClient
 from kazoo.security import make_digest_acl
 from kazoo.exceptions import NoNodeException
-from pylons import g
+
+from r2.lib import hooks
+from r2.lib.contrib import ipaddress
 
 
 def connect_to_zookeeper(hostlist, credentials):
@@ -43,13 +45,13 @@ def connect_to_zookeeper(hostlist, credentials):
 
     client = KazooClient(hostlist,
                          timeout=5,
-                         max_retries=3)
+                         max_retries=3,
+                         auth_data=[("digest", ":".join(credentials))])
 
     # convenient helper function for making credentials
     client.make_acl = functools.partial(make_digest_acl, *credentials)
 
     client.start()
-    client.add_auth("digest", ":".join(credentials))
     return client
 
 
@@ -66,13 +68,19 @@ class LiveConfig(object):
 
         @client.DataWatch(key)
         def watcher(data, stat):
-            self.data = json.loads(data)
+            if data and data.startswith("gzip"):
+                data = zlib.decompress(data[len("gzip"):])
+            self.data = json.loads(data or '{}')
+            hooks.get_hook("worker.live_config.update").call()
 
     def __getitem__(self, key):
         return self.data[key]
 
     def get(self, key, default=None):
         return self.data.get(key, default)
+
+    def iteritems(self):
+        return self.data.iteritems()
 
     def __repr__(self):
         return "<LiveConfig %r>" % self.data
@@ -142,72 +150,85 @@ class LiveList(object):
                                        "push" if self.is_watching else "pull")
 
 
-class LiveDict(MutableMapping):
-    """Zookeeper-backed dictionary - similar to LiveList in that it can be
-    shared by all apps.
+class ReducedLiveList(object):
+    """Store a copy of the reduced data in addition to the full LiveList.
+
+    This is useful for cases where the map/reduce phase is slow and CPU
+    intensive. By storing the reduced data separately the map/reduce only needs
+    to be done by the process that's updating the list. All other processes
+    watch the reduced data node.
+
     """
 
-    def __init__(self, client, path, watch=True):
+    def __init__(self, client, root, reduced_data_node, map_fn=None,
+                 reduce_fn=lambda L: L, to_json_fn=None, from_json_fn=None):
+        # don't watch the underlying LiveList because all updates are triggered
+        # on the reduced data node
+        self.live_list = LiveList(
+            client, root, map_fn=map_fn, reduce_fn=reduce_fn, watch=False)
+
         self.client = client
-        self.path = path
-        self.is_watching = watch
-        self.lock_group = "LiveDict"
+        self.root = root
+        self.reduced_data_node = reduced_data_node
 
-        acl = [self.client.make_acl(read=True, write=True)]
-        self.client.ensure_path(self.path, acl)
+        acl = [self.client.make_acl(
+            read=True, write=True, create=True, delete=True)]
+        self.client.ensure_path(self.reduced_data_node, acl)
 
-        if watch:
-            self._data = {}
+        self.data = []
+        self.to_json_fn = to_json_fn
+        self.from_json_fn = from_json_fn
 
-            @client.DataWatch(path)
-            def watcher(data, stat):
-                self._set_data(data)
+        @client.DataWatch(self.reduced_data_node)
+        def watcher(json_data, stat):
+            if json_data and json_data.startswith("gzip"):
+                json_data = zlib.decompress(json_data[len("gzip"):])
+            self.data = self.from_json_fn(json_data or '{}')
 
-    def fetch_data(self):
-        self._refresh()
-        return self._data
+    def update(self):
+        data = self.live_list.get(reduce=True)
+        json_data = self.to_json_fn(data)
+        compressed_data = "gzip" + zlib.compress(json_data)
+        self.client.set(self.reduced_data_node, compressed_data)
 
-    def _refresh(self):
-        if not self.is_watching:
-            self._set_data(self.client.get(self.path)[0])
+    def add(self, item):
+        self.live_list.add(item)
+        self.update()
 
-    def _set_data(self, json_string):
-        self._data = json.loads(json_string or "{}")
+    def remove(self, item):
+        self.live_list.remove(item)
+        self.update()
 
-    def __getitem__(self, key):
-        self._refresh()
-        return self._data[key]
-
-    def __setitem__(self, key, value):
-        with g.make_lock(self.lock_group, self.path):
-            self._refresh()
-            self._data[key] = value
-            json_data = json.dumps(self._data)
-            self.client.set(self.path, json_data)
-
-    def __delitem__(self, key):
-        with g.make_lock(self.lock_group, self.path):
-            self._refresh()
-            del self._data[key]
-            json_data = json.dumps(self._data)
-            self.client.set(self.path, json_data)
-
-    def __repr__(self):
-        self._refresh()
-        return "<LiveDict {}>".format(self._data)
+    def get(self, reduce=True):
+        if reduce:
+            return self.data
+        else:
+            return self.live_list.get(reduce=False)
 
     def __iter__(self):
-        self._refresh()
-        return iter(self._data)
-
-    def items(self):
-        self._refresh()
-        return self._data.items()
-
-    def iteritems(self):
-        self._refresh()
-        return self._data.iteritems()
+        return iter(self.data)
 
     def __len__(self):
-        self._refresh()
-        return len(self._data)
+        return len(self.data)
+
+    def __repr__(self):
+        return "<%s %r>" % (self.__class__.__name__, self.data)
+
+
+class IPNetworkLiveList(ReducedLiveList):
+    def __init__(self, client, root, reduced_data_node):
+        def ipnetwork_to_json(ipnetwork_list):
+            d = json.dumps([str(ipn) for ipn in ipnetwork_list])
+            return d
+
+        def json_to_ipnetwork(d):
+            ipnetwork_list = [ipaddress.ip_network(s) for s in json.loads(d)]
+            return ipnetwork_list
+
+        ReducedLiveList.__init__(
+            self, client, root, reduced_data_node,
+            map_fn=ipaddress.ip_network,
+            reduce_fn=ipaddress.collapse_addresses,
+            to_json_fn=ipnetwork_to_json,
+            from_json_fn=json_to_ipnetwork,
+        )

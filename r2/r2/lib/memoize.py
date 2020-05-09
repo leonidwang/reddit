@@ -16,19 +16,17 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from hashlib import md5
 
 from r2.lib.filters import _force_utf8
-from r2.lib.cache import NoneResult, make_key
+from r2.lib.cache import NoneResult, make_key_id
 from r2.lib.lock import make_lock_factory
-from pylons import g
+from pylons import app_globals as g
 
-make_lock = g.make_lock
-memoizecache = g.memoizecache
 
 def memoize(iden, time = 0, stale=False, timeout=30):
     def memoize_fn(fn):
@@ -39,18 +37,18 @@ def memoize(iden, time = 0, stale=False, timeout=30):
             #overwritten no matter what
             update = kw.pop('_update', False)
 
-            key = make_key(iden, *a, **kw)
+            key = "memo:%s:%s" % (iden, make_key_id(*a, **kw))
 
-            res = None if update else memoizecache.get(key, stale=stale)
+            res = None if update else g.memoizecache.get(key, stale=stale)
 
             if res is None:
                 # not cached, we should calculate it.
-                with make_lock("memoize", 'memoize_lock(%s)' % key,
-                               time=timeout, timeout=timeout):
+                with g.make_lock("memoize", 'memoize_lock(%s)' % key,
+                                 time=timeout, timeout=timeout):
 
                     # see if it was completed while we were waiting
                     # for the lock
-                    stored = None if update else memoizecache.get(key)
+                    stored = None if update else g.memoizecache.get(key)
                     if stored is not None:
                         # it was calculated while we were waiting
                         res = stored
@@ -59,7 +57,7 @@ def memoize(iden, time = 0, stale=False, timeout=30):
                         res = fn(*a, **kw)
                         if res is None:
                             res = NoneResult
-                        memoizecache.set(key, res, time=time)
+                        g.memoizecache.set(key, res, time=time)
 
             if res == NoneResult:
                 res = None

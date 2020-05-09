@@ -16,14 +16,19 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
+
+from r2.lib.cache import MemcachedError
+
 
 # smart get multi:
 # For any keys not found in the cache, miss_fn() is run and the result is
 # stored in the cache. Then it returns everything, both the hits and misses.
-def sgm(cache, keys, miss_fn, str prefix='', int time=0, stale=False, found_fn=None, _update=False):
+def sgm(cache, keys, miss_fn, str prefix='', int time=0, stale=False,
+        found_fn=None, _update=False, stat_subname=None,
+        ignore_set_errors=False):
     cdef dict ret
     cdef dict s_keys
     cdef dict cached
@@ -43,10 +48,14 @@ def sgm(cache, keys, miss_fn, str prefix='', int time=0, stale=False, found_fn=N
     if _update:
         cached = {}
     else:
+        kw = {}
         if stale:
-            cached = cache.get_multi(s_keys.keys(), prefix=prefix, stale=stale)
-        else:
-            cached = cache.get_multi(s_keys.keys(), prefix=prefix)
+            kw['stale'] = stale
+        if stat_subname:
+            kw['stat_subname'] = stat_subname
+
+        cached = cache.get_multi(s_keys.keys(), prefix=prefix, **kw)
+
         for k, v in cached.iteritems():
             ret[s_keys[k]] = v
 
@@ -69,6 +78,11 @@ def sgm(cache, keys, miss_fn, str prefix='', int time=0, stale=False, found_fn=N
         calculated_to_cache = {}
         for k, v in calculated.iteritems():
             calculated_to_cache[str(k)] = v
-        cache.set_multi(calculated_to_cache, prefix=prefix)
+
+        try:
+            cache.set_multi(calculated_to_cache, prefix=prefix, time=time)
+        except MemcachedError:
+            if not ignore_set_errors:
+                raise
 
     return ret

@@ -16,12 +16,14 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
+import math
 from datetime import datetime, timedelta
-from pylons import g
+from pylons import app_globals as g
+
 
 cdef extern from "math.h":
     double log10(double)
@@ -53,11 +55,17 @@ cpdef double _hot(long ups, long downs, double date):
     else:
         sign = 0
     seconds = date - 1134028003
-    return round(order + sign * seconds / 45000, 7)
+    return round(sign * order + seconds / 45000, 7)
 
 cpdef double controversy(long ups, long downs):
     """The controversy sort."""
-    return float(ups + downs) / max(abs(score(ups, downs)), 1)
+    if downs <= 0 or ups <= 0:
+        return 0
+
+    magnitude = ups + downs
+    balance = float(downs) / ups if ups > downs else float(ups) / downs
+
+    return magnitude ** balance
 
 cpdef double _confidence(int ups, int downs):
     """The confidence sort.
@@ -89,3 +97,36 @@ def confidence(int ups, int downs):
         return _confidences[downs + ups * down_range]
     else:
         return _confidence(ups, downs)
+
+cpdef double qa(int question_ups, int question_downs, int question_length,
+                op_children):
+    """The Q&A-type sort.
+
+    Similar to the "best" (confidence) sort, but specially designed for
+    Q&A-type threads to highlight good question/answer pairs.
+    """
+    question_score = confidence(question_ups, question_downs)
+
+    if not op_children:
+        return _qa(question_score, question_length)
+
+    # Only take into account the "best" answer from OP.
+    best_score = None
+    for answer in op_children:
+        score = confidence(answer._ups, answer._downs)
+        if best_score is None or score > best_score:
+            best_score = score
+            answer_length = len(answer.body)
+    return _qa(question_score, question_length, best_score, answer_length)
+
+cpdef double _qa(double question_score, int question_length,
+                 double answer_score=0, int answer_length=1):
+    score_modifier = question_score + answer_score
+
+    # Give more weight to longer posts, but count longer text less and less to
+    # avoid artificially high rankings for long-spam posts.
+    length_modifier = log10(question_length + answer_length)
+
+    # Add together the weighting from the scores and lengths, but emphasize
+    # score more.
+    return score_modifier + (length_modifier / 5)

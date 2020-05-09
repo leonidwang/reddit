@@ -16,14 +16,13 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
 <%!
-   from r2.lib.template_helpers import static, s3_https_if_secure
-   from r2.models.subreddit import DefaultSR
-   from r2.lib import authentication
+   from r2.lib.template_helpers import display_link_karma, header_url
+   from r2.models.subreddit import DefaultSR, FakeSubreddit
    
  %>
 <%namespace file="utils.html" import="plain_link, img_link, separator, logout"/>
@@ -35,6 +34,7 @@
     if toolbars and isinstance(toolbars[0], PageNameNav):
         nav = toolbars[0]
         toolbars = toolbars[1:]
+    nav = thing.short_title or nav
  %>
 <div id="preload">
     <div class="commentcount"><div class="comments"></div><div class="comments preloaded"></div></div>
@@ -43,19 +43,14 @@
   <div class="left">
    <%
         d = DefaultSR()
-        if c.site.header and c.allow_styles:
-            header_img = c.site.header
+        if c.site.header and c.allow_styles and not c.site.quarantine:
+            header_img = header_url(c.site.header)
             header_size = c.site.header_size
             header_title = c.site.header_title
         else:
-            header_img = d.header
+            header_img = header_url(d.header)
             header_size = None
             header_title = d.header_title
-
-        if header_img == g.default_header_url:
-            header_img = static(header_img)
-        else:
-            header_img = s3_https_if_secure(header_img)
     %>
     ${img_link(c.site.name, header_img, '/', _id = "header-img-a", img_id = 'header-img', title = header_title, size = header_size)}
   </div>
@@ -71,7 +66,7 @@
            mail_path = '/message/inbox/'
       %>
       ${plain_link('', mail_path, _sr_path=False, _class=mail_img_class, _id='mail')}
-      %if c.show_mod_mail:
+      %if c.user_is_loggedin and c.user.is_moderator_somewhere:
         <%
             mail_path = '/message/moderator/'
             if c.have_mod_messages:
@@ -88,7 +83,7 @@
     %if c.user_is_loggedin:
     <div class="menuitem">
       ${plain_link(c.user.name, "/user/%s/" % c.user.name, _sr_path=False)}
-      &nbsp;(<b>${c.user.safe_karma}</b>)
+      &nbsp;(<b>${display_link_karma(c.user.link_karma)}</b>)
     </div>
     <div class="menuitem">
       ${plain_link("subreddits", "/subreddits/mine", _sr_path=False)}
@@ -96,17 +91,17 @@
     <div class="menuitem">
       ${plain_link("submit", "/submit", _sr_path=False)}
     </div>
-    %if authentication.user_can_log_out():
+    %if g.auth_provider.is_logout_allowed():
     <div class="menuitem bottm-bar">
-      ${logout()}
+      ${logout(dest=request.fullpath)}
     </div>
     % endif
    %else:
     <div class="menuitem">
-      ${plain_link("login", "/login", _sr_path=False)}
+      ${plain_link("log in", "/login", _sr_path=False)}
     </div>
     <div class="menuitem bottm-bar">
-      ${plain_link("register", "/register", _sr_path=False)}
+      ${plain_link("sign up", "/register", _sr_path=False)}
     </div>
     <div class="menuitem">
       ${plain_link("subreddits", "/subreddits/", _sr_path=False)}
@@ -115,6 +110,11 @@
     <div class="menuitem">
       ${plain_link("search", "/search")}
     </div>
+    %if not isinstance(c.site, FakeSubreddit):
+    <div class="menuitem">
+      ${plain_link("sidebar", "/about/sidebar")}
+    </div>
+    %endif
   </div>
 </div>
 %if toolbars:

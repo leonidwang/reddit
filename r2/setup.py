@@ -17,87 +17,85 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from ez_setup import use_setuptools
-use_setuptools()
-
-from setuptools import find_packages
-from distutils.core import setup, Extension
 import os
 import fnmatch
-
+import sys
+from setuptools import setup, find_packages, Extension
 
 
 commands = {}
 
 
 try:
-    from Cython.Distutils import build_ext
+    from Cython.Build import cythonize
 except ImportError:
-    pass
+    print "Cannot find Cython. Skipping Cython build."
+    pyx_extensions = []
 else:
-    commands.update({
-        "build_ext": build_ext
-    })
+    pyx_files = []
+    for root, directories, files in os.walk('.'):
+        for f in fnmatch.filter(files, '*.pyx'):
+            pyx_files.append(os.path.join(root, f))
+    pyx_extensions = cythonize(pyx_files)
 
 
+# guard against import errors in case this is the first run of setup.py and we
+# don't have any dependencies (including baseplate) yet
 try:
-    import r2.lib.translation
+    from baseplate.integration.thrift.command import ThriftBuildPyCommand
 except ImportError:
-    pass
+    print "Cannot find Baseplate. Skipping Thrift build."
 else:
-    commands["extract_messages"] = r2.lib.translation.extract_messages
+    commands["build_py"] = ThriftBuildPyCommand
 
-
-# add the cython modules
-pyx_extensions = []
-for root, directories, files in os.walk('.'):
-    for f in fnmatch.filter(files, '*.pyx'):
-        path = os.path.join(root, f)
-        module_name, _ = os.path.splitext(path)
-        module_name = os.path.normpath(module_name)
-        module_name = module_name.replace(os.sep, '.')
-        pyx_extensions.append(Extension(module_name, [path]))
-
-
-discount_path = "r2/lib/contrib/discount"
 
 setup(
     name="r2",
     version="",
     install_requires=[
-        "webob==1.0.8",
-        "Pylons==0.9.7",
-        "Routes==1.11",
+        "Pylons",
+        "Routes",
         "mako>=0.5",
         "boto >= 2.0",
         "pytz",
         "pycrypto",
-        "Babel>=0.9.1",
+        "Babel>=1.0",
         "cython>=0.14",
-        "SQLAlchemy==0.7.4",
+        "SQLAlchemy",
         "BeautifulSoup",
-        "cssutils==0.9.5.1",
         "chardet",
         "psycopg2",
-        "pycountry",
         "pycassa>=1.7.0",
-        "PIL",
         "pycaptcha",
         "amqplib",
-        "pylibmc>=1.2.1",
         "py-bcrypt",
         "snudown>=1.1.0",
         "l2cs>=2.0.2",
         "lxml",
         "kazoo",
         "stripe",
+        "requests",
+        "tinycss2",
+        "unidecode",
+        "PyYAML",
+        "Pillow",
+        "pylibmc==1.2.2",
+        "webob",
+        "webtest",
+        "python-snappy",
+        "httpagentparser==1.7.8",
+        "raven",
     ],
+    # setup tests (allowing for "python setup.py test")
+    tests_require=['mock', 'nose', 'coverage'],
+    test_suite="nose.collector",
     dependency_links=[
         "https://github.com/reddit/snudown/archive/v1.1.3.tar.gz#egg=snudown-1.1.3",
+        "https://s3.amazonaws.com/code.reddit.com/pycaptcha-0.4.tar.gz#egg=pycaptcha-0.4",
     ],
     packages=find_packages(exclude=["ez_setup"]),
     cmdclass=commands,
@@ -117,5 +115,27 @@ setup(
     shell = pylons.commands:ShellCommand
     [paste.filter_app_factory]
     gzip = r2.lib.gzipper:make_gzip_middleware
+    [r2.provider.media]
+    s3 = r2.lib.providers.media.s3:S3MediaProvider
+    filesystem = r2.lib.providers.media.filesystem:FileSystemMediaProvider
+    [r2.provider.cdn]
+    fastly = r2.lib.providers.cdn.fastly:FastlyCdnProvider
+    cloudflare = r2.lib.providers.cdn.cloudflare:CloudFlareCdnProvider
+    null = r2.lib.providers.cdn.null:NullCdnProvider
+    [r2.provider.auth]
+    cookie = r2.lib.providers.auth.cookie:CookieAuthenticationProvider
+    http = r2.lib.providers.auth.http:HttpAuthenticationProvider
+    [r2.provider.support]
+    zendesk = r2.lib.providers.support.zendesk:ZenDeskProvider
+    [r2.provider.search]
+    cloudsearch = r2.lib.providers.search.cloudsearch:CloudSearchProvider
+    solr = r2.lib.providers.search.solr:SolrSearchProvider
+    [r2.provider.image_resizing]
+    imgix = r2.lib.providers.image_resizing.imgix:ImgixImageResizingProvider
+    no_op = r2.lib.providers.image_resizing.no_op:NoOpImageResizingProvider
+    unsplashit = r2.lib.providers.image_resizing.unsplashit:UnsplashitImageResizingProvider
+    [r2.provider.email]
+    null = r2.lib.providers.email.null:NullEmailProvider
+    mailgun = r2.lib.providers.email.mailgun:MailgunEmailProvider
     """,
 )

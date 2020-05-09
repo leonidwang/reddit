@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 """View models for the traffic statistic pages on reddit."""
@@ -27,7 +27,10 @@ import pytz
 import urllib
 
 from pylons.i18n import _
-from pylons import g, c, request
+from pylons import request
+from pylons import tmpl_context as c
+from pylons import app_globals as g
+
 import babel.core
 from babel.dates import format_datetime
 from babel.numbers import format_currency
@@ -36,7 +39,7 @@ from r2.lib import promote
 from r2.lib.db.sorts import epoch_seconds
 from r2.lib.menus import menu
 from r2.lib.menus import NavButton, NamedButton, PageNameNav, NavMenu
-from r2.lib.pages.pages import Reddit, TimeSeriesChart, UserList, TabbedPane
+from r2.lib.pages.pages import Reddit, TimeSeriesChart, TabbedPane
 from r2.lib.promote import cost_per_mille, cost_per_click
 from r2.lib.template_helpers import format_number
 from r2.lib.utils import Storage, to_date, timedelta_by_name
@@ -205,14 +208,19 @@ class RedditTraffic(Templated):
         raise NotImplementedError()
 
 
-def make_subreddit_traffic_report(subreddits=None):
+def make_subreddit_traffic_report(subreddits=None, num=None):
     """Return a report of subreddit traffic in the last full month.
 
     If given a list of subreddits, those subreddits will be put in the report
     otherwise the top subreddits by pageviews will be automatically chosen.
 
     """
-    subreddit_summary = traffic.PageviewsBySubreddit.top_last_month(subreddits)
+
+    if subreddits:
+        subreddit_summary = traffic.PageviewsBySubreddit.last_month(subreddits)
+    else:
+        subreddit_summary = traffic.PageviewsBySubreddit.top_last_month(num)
+
     report = []
     for srname, data in subreddit_summary:
         if srname == _DefaultSR.name:
@@ -232,7 +240,7 @@ def make_subreddit_traffic_report(subreddits=None):
 class SitewideTraffic(RedditTraffic):
     """An overview of all traffic to the site."""
     def __init__(self):
-        self.subreddit_summary = make_subreddit_traffic_report()
+        self.subreddit_summary = make_subreddit_traffic_report(num=250)
         RedditTraffic.__init__(self, g.domain)
 
     def get_dow_summary(self):
@@ -479,15 +487,6 @@ def _is_promo_preliminary(end_date):
     return end_date + datetime.timedelta(days=1) > now
 
 
-def get_traffic_dates(thing):
-    """Retrieve the start and end of a Promoted Link or PromoCampaign."""
-    now = datetime.datetime.now(g.tz).replace(minute=0, second=0,
-                                              microsecond=0)
-    start, end = promote.get_total_run(thing)
-    end = min(now, end)
-    return start, end
-
-
 def get_promo_traffic(thing, start, end):
     """Get traffic for a Promoted Link or PromoCampaign"""
     if isinstance(thing, Link):
@@ -504,6 +503,8 @@ def get_promo_traffic(thing, start, end):
 
     if imps and not clicks:
         clicks = [(imps[0][0], (0,))]
+    elif clicks and not imps:
+        imps = [(clicks[0][0], (0,))]
 
     history = traffic.zip_timeseries(imps, clicks, order="ascending")
     return history
@@ -511,7 +512,7 @@ def get_promo_traffic(thing, start, end):
 
 def get_billable_traffic(campaign):
     """Get traffic for dates when PromoCampaign is active."""
-    start, end = get_traffic_dates(campaign)
+    start, end = promote.get_traffic_dates(campaign)
     return get_promo_traffic(campaign, start, end)
 
 
@@ -522,7 +523,8 @@ def is_early_campaign(campaign):
 
 def is_launched_campaign(campaign):
     now = datetime.datetime.now(g.tz).date()
-    return bool(campaign.trans_id) and campaign.start_date.date() <= now
+    return (promote.charged_or_not_needed(campaign) and
+            campaign.start_date.date() <= now)
 
 
 class PromotedLinkTraffic(Templated):
@@ -540,8 +542,6 @@ class PromotedLinkTraffic(Templated):
                                                            else 'all campaigns')
 
         editable = c.user_is_sponsor or c.user._id == thing.author_id
-        self.viewer_list = TrafficViewerList(thing, editable)
-
         self.traffic_last_modified = traffic.get_traffic_last_modified()
         self.traffic_lag = (datetime.datetime.utcnow() -
                             self.traffic_last_modified)
@@ -550,16 +550,18 @@ class PromotedLinkTraffic(Templated):
         Templated.__init__(self)
 
     @classmethod
-    def make_campaign_table_row(cls, id, start, end, target, bid, impressions,
-                                clicks, is_live, is_active, url, is_total):
+    def make_campaign_table_row(cls, id, start, end, target, location,
+            budget_dollars, spent, paid_impressions, impressions, clicks,
+            is_live, is_active, url, is_total):
+
         if impressions:
-            cpm = format_currency(promote.cost_per_mille(bid, impressions),
+            cpm = format_currency(promote.cost_per_mille(spent, impressions),
                                   'USD', locale=c.locale)
         else:
             cpm = '---'
 
         if clicks:
-            cpc = format_currency(promote.cost_per_click(bid, clicks), 'USD',
+            cpc = format_currency(promote.cost_per_click(spent, clicks), 'USD',
                                   locale=c.locale)
             ctr = format_number(_clickthrough_rate(impressions, clicks))
         else:
@@ -571,8 +573,11 @@ class PromotedLinkTraffic(Templated):
             'start': start,
             'end': end,
             'target': target,
-            'bid': format_currency(bid, 'USD', locale=c.locale),
-            'impressions': format_number(impressions),
+            'location': location,
+            'budget': format_currency(budget_dollars, 'USD', locale=c.locale),
+            'spent': format_currency(spent, 'USD', locale=c.locale),
+            'impressions_purchased': format_number(paid_impressions),
+            'impressions_delivered': format_number(impressions),
             'cpm': cpm,
             'clicks': format_number(clicks),
             'cpc': cpc,
@@ -587,7 +592,9 @@ class PromotedLinkTraffic(Templated):
     def make_campaign_table(self):
         campaigns = PromoCampaign._by_link(self.thing._id)
 
-        total_bid = 0
+        total_budget_dollars = 0.
+        total_spent = 0
+        total_paid_impressions = 0
         total_impressions = 0
         total_clicks = 0
 
@@ -608,17 +615,32 @@ class PromotedLinkTraffic(Templated):
 
             start = to_date(camp.start_date).strftime('%Y-%m-%d')
             end = to_date(camp.end_date).strftime('%Y-%m-%d')
-            target = camp.sr_name or 'frontpage'
+            target = camp.target.pretty_name
+            location = camp.location_str
+            spent = promote.get_spent_amount(camp)
             is_active = self.campaign and self.campaign._id36 == camp._id36
             url = '/traffic/%s/%s' % (self.thing._id36, camp._id36)
             is_total = False
-            row = self.make_campaign_table_row(camp._id36, start, end, target,
-                                               camp.bid, impressions, clicks,
-                                               is_live, is_active, url,
-                                               is_total)
+            campaign_budget_dollars = camp.total_budget_dollars
+            row = self.make_campaign_table_row(camp._id36,
+                                               start=start,
+                                               end=end,
+                                               target=target,
+                                               location=location,
+                                               budget_dollars=campaign_budget_dollars,
+                                               spent=spent,
+                                               paid_impressions=camp.impressions,
+                                               impressions=impressions,
+                                               clicks=clicks,
+                                               is_live=is_live,
+                                               is_active=is_active,
+                                               url=url,
+                                               is_total=is_total)
             self.campaign_table.append(row)
 
-            total_bid += camp.bid
+            total_budget_dollars += campaign_budget_dollars
+            total_spent += spent
+            total_paid_impressions += camp.impressions
             total_impressions += impressions
             total_clicks += clicks
 
@@ -626,19 +648,37 @@ class PromotedLinkTraffic(Templated):
         start = '---'
         end = '---'
         target = '---'
+        location = '---'
         is_live = False
         is_active = not self.campaign
         url = '/traffic/%s' % self.thing._id36
         is_total = True
-        row = self.make_campaign_table_row(_('total'), start, end, target,
-                                           total_bid, total_impressions,
-                                           total_clicks, is_live, is_active,
-                                           url, is_total)
+        row = self.make_campaign_table_row(_('total'),
+                                           start=start,
+                                           end=end,
+                                           target=target,
+                                           location=location,
+                                           budget_dollars=total_budget_dollars,
+                                           spent=total_spent,
+                                           paid_impressions=total_paid_impressions,
+                                           impressions=total_impressions,
+                                           clicks=total_clicks,
+                                           is_live=is_live,
+                                           is_active=is_active,
+                                           url=url,
+                                           is_total=is_total)
         self.campaign_table.append(row)
 
     def check_dates(self, thing):
         """Shorten range for display and add next/prev buttons."""
-        start, end = get_traffic_dates(thing)
+        start, end = promote.get_traffic_dates(thing)
+
+        # Check date of latest traffic (campaigns can end early).
+        history = list(get_promo_traffic(thing, start, end))
+        if history:
+            end = max(date for date, data in history)
+            end = end.replace(tzinfo=g.tz)  # get_promo_traffic returns tz naive
+                                            # datetimes but is actually g.tz
 
         if self.period:
             display_start = self.after
@@ -653,7 +693,7 @@ class PromotedLinkTraffic(Templated):
                 display_start = display_end - self.period
 
             if display_start > start:
-                p = request.get.copy()
+                p = request.GET.copy()
                 p.update({
                     'after': None,
                     'before': display_start.strftime('%Y%m%d%H'),
@@ -663,7 +703,7 @@ class PromotedLinkTraffic(Templated):
                 display_start = start
 
             if display_end < end:
-                p = request.get.copy()
+                p = request.GET.copy()
                 p.update({
                     'after': display_end.strftime('%Y%m%d%H'),
                     'before': None,
@@ -721,7 +761,7 @@ class PromotedLinkTraffic(Templated):
         import csv
         import cStringIO
 
-        start, end = get_traffic_dates(thing)
+        start, end = promote.get_traffic_dates(thing)
         history = cls.get_hourly_traffic(thing, start, end)
 
         out = cStringIO.StringIO()
@@ -736,33 +776,6 @@ class PromotedLinkTraffic(Templated):
             writer.writerow((date,) + values)
 
         return out.getvalue()
-
-
-class TrafficViewerList(UserList):
-    """Traffic share list on /traffic/*"""
-
-    destination = "traffic_viewer"
-    remove_action = "rm_traffic_viewer"
-    type = "traffic_viewer"
-
-    def __init__(self, link, editable=True):
-        self.link = link
-        UserList.__init__(self, editable=editable)
-
-    @property
-    def form_title(self):
-        return _("share traffic")
-
-    @property
-    def table_title(self):
-        return _("current viewers")
-
-    def user_ids(self):
-        return promote.traffic_viewers(self.link)
-
-    @property
-    def container_name(self):
-        return self.link._fullname
 
 
 class SubredditTrafficReport(Templated):

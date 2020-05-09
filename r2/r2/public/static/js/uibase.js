@@ -13,7 +13,7 @@ r.ui.Collapse = function(el, target, key) {
     r.ui.Base.call(this, el)
     this.target = target
     this.key = 'ui.collapse.' + key
-    this.isCollapsed = store.get(this.key) == true
+    this.isCollapsed = store.safeGet(this.key) == true
     this.$el.click($.proxy(this, 'toggle', null, false))
     this.toggle(this.isCollapsed, true)
 }
@@ -33,7 +33,7 @@ r.ui.Collapse.prototype = {
         }
 
         this.isCollapsed = collapsed
-        store.set(this.key, collapsed)
+        store.safeSet(this.key, collapsed)
         this.update()
     },
 
@@ -71,7 +71,7 @@ r.ui.Summarize.prototype = {
         this.$el.addClass('summarized')
         this.$hiddenItems.hide()
 
-        this.$toggleButton.html(r._('&hellip; and %(count)s more &rArr;').format({
+        this.$toggleButton.text(r._('… and %(count)s more ⇒').format({
             count: this.$hiddenItems.length
         }))
     },
@@ -79,7 +79,7 @@ r.ui.Summarize.prototype = {
     _expand: function() {
         this.$el.removeClass('summarized')
         this.$hiddenItems.show()
-        this.$toggleButton.html(r._('&lArr; less'))
+        this.$toggleButton.text(r._('⇐ less'))
     },
 
     _toggle: function(e) {
@@ -90,11 +90,4 @@ r.ui.Summarize.prototype = {
         }
         e.preventDefault()
     }
-};
-
-r.ui.collapseListingChooser = function() {
-    if (store.get('ui.collapse.listingchooser') == true) {
-        $('body').addClass('listing-chooser-collapsed')
-    }
 }
-

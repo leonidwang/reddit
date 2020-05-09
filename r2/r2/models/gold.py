@@ -16,39 +16,55 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from r2.lib.db.tdb_sql import make_metadata, index_str, create_table
 
-from pylons import g, c
-from pylons.i18n import _
+import json
+import pytz
+import uuid
+
+from pycassa import NotFoundException
+from pycassa.system_manager import ASCII_TYPE, INT_TYPE, TIME_UUID_TYPE, UTF8_TYPE
+from pycassa.util import convert_uuid_to_time
+from pylons import tmpl_context as c
+from pylons import app_globals as g
+from pylons.i18n import _, ungettext
 from datetime import datetime
 import sqlalchemy as sa
-from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.orm.exc import NoResultFound
-from sqlalchemy.schema import Column
-from sqlalchemy.sql import and_
-from sqlalchemy.types import String, Integer
+from sqlalchemy.sql.expression import select
+from sqlalchemy.sql.functions import sum as sa_sum
 
-from xml.dom.minidom import Document
-from r2.lib.utils import tup, randstr
-from httplib import HTTPSConnection
-from urlparse import urlparse
+from r2.lib.utils import GoldPrice, randstr, to_date
+import re
+from random import choice
 from time import time
-import socket, base64
-from BeautifulSoup import BeautifulStoneSoup
+
+from r2.lib.db import tdb_cassandra
+from r2.lib.db.tdb_cassandra import NotFound, view_of
+from r2.models import Account
+from r2.models.subreddit import Frontpage
+from r2.models.wiki import WikiPage, WikiPageIniItem
+from r2.lib.memoize import memoize
+
+import stripe
 
 gold_bonus_cutoff = datetime(2010,7,27,0,0,0,0,g.tz)
+gold_static_goal_cutoff = datetime(2013, 11, 7, tzinfo=g.display_tz)
+
+NON_REVENUE_STATUSES = ("declined", "chargeback", "fudge", "invalid",
+                        "refunded", "reversed")
 
 ENGINE_NAME = 'authorize'
 
 ENGINE = g.dbm.get_engine(ENGINE_NAME)
 METADATA = make_metadata(ENGINE)
+TIMEZONE = pytz.timezone("America/Los_Angeles")
 
 Session = scoped_session(sessionmaker(bind=ENGINE))
 Base = declarative_base(bind=ENGINE)
@@ -67,81 +83,157 @@ gold_table = sa.Table('reddit_gold', METADATA,
                       sa.Column('secret', sa.String, nullable = True),
                       sa.Column('account_id', sa.String, nullable = True),
                       sa.Column('days', sa.Integer, nullable = True),
-                      sa.Column('subscr_id', sa.String, nullable = True))
+                      sa.Column('subscr_id', sa.String, nullable = True),
+                      sa.Column('gilding_type', sa.String, nullable = True))
 
 indices = [index_str(gold_table, 'status', 'status'),
            index_str(gold_table, 'date', 'date'),
            index_str(gold_table, 'account_id', 'account_id'),
-           index_str(gold_table, 'secret', 'secret', unique = True),
+           index_str(gold_table, 'secret', 'secret'),
            index_str(gold_table, 'payer_email', 'payer_email'),
            index_str(gold_table, 'subscr_id', 'subscr_id')]
 create_table(gold_table, indices)
 
 
-def with_sqlalchemy_session(f):
-    """Ensures sqlalchemy session is closed (due to connection pooling)."""
-    def close_session_after(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        finally:
-            Session.remove()
+class GoldRevenueGoalByDate(object):
+    __metaclass__ = tdb_cassandra.ThingMeta
 
-    return close_session_after
+    _use_db = True
+    _cf_name = "GoldRevenueGoalByDate"
+    _read_consistency_level = tdb_cassandra.CL.ONE
+    _write_consistency_level = tdb_cassandra.CL.ALL
+    _extra_schema_creation_args = {
+        "column_name_class": UTF8_TYPE,
+        "default_validation_class": INT_TYPE,
+    }
+    _compare_with = UTF8_TYPE
+    _type_prefix = None
 
+    ROWKEY = '1'
 
-class GoldPartnerCodesExhaustedError(Exception):
-    pass
-
-
-class GoldPartnerDealCode(Base):
-    """Promo codes for deals from reddit gold partners."""
-
-    __tablename__ = "reddit_gold_partner_deal_codes"
-
-    id = Column(Integer, primary_key=True)
-    deal = Column(String, nullable=False)
-    code = Column(String, nullable=False)
-    user = Column(Integer, nullable=True)
+    @staticmethod
+    def _colkey(date):
+        return date.strftime("%Y-%m-%d")
 
     @classmethod
-    @with_sqlalchemy_session
-    def get_codes_for_user(cls, user):
-        results = Session.query(cls).filter(cls.user == user._id)
-        codes = {r.deal: r.code for r in results}
-        return codes
-    
+    def set(cls, date, goal):
+        cls._cf.insert(cls.ROWKEY, {cls._colkey(date): int(goal)})
+
     @classmethod
-    @with_sqlalchemy_session
-    def claim_code(cls, user, deal):
-        # check if they already have a code for this deal and return it
+    def get(cls, date):
+        """Gets the goal for a date, or the nearest previous goal."""
         try:
-            result = (Session.query(cls)
-                      .filter(and_(cls.user == user._id,
-                                   cls.deal == deal))
-                      .one())
-            return result.code
-        except NoResultFound:
-            pass
+            colkey = cls._colkey(date)
+            col = cls._cf.get(
+                cls.ROWKEY,
+                column_reversed=True,
+                column_start=colkey,
+                column_count=1,
+            )
+            return col.values()[0]
+        except NotFoundException:
+            return None
 
-        # select an unclaimed code, assign it to the user, and return it
-        try:
-            claiming = (Session.query(cls)
-                        .filter(and_(cls.deal == deal,
-                                     cls.user == None,
-                                     func.pg_try_advisory_lock(cls.id)))
-                        .limit(1)
-                        .one())
-        except NoResultFound:
-            raise GoldPartnerCodesExhaustedError
 
-        claiming.user = user._id
-        Session.add(claiming)
-        Session.commit()
+class GildedCommentsByAccount(tdb_cassandra.DenormalizedRelation):
+    _use_db = True
+    _last_modified_name = 'Gilding'
+    _views = []
 
-        # release the lock
-        Session.query(func.pg_advisory_unlock_all()).all()
+    @classmethod
+    def value_for(cls, thing1, thing2):
+        return ''
 
-        return claiming.code 
+    @classmethod
+    def gild(cls, user, thing):
+        cls.create(user, [thing])
+
+
+class GildedLinksByAccount(tdb_cassandra.DenormalizedRelation):
+    _use_db = True
+    _last_modified_name = 'Gilding'
+    _views = []
+
+    @classmethod
+    def value_for(cls, thing1, thing2):
+        return ''
+
+    @classmethod
+    def gild(cls, user, thing):
+        cls.create(user, [thing])
+
+
+@view_of(GildedCommentsByAccount)
+@view_of(GildedLinksByAccount)
+class GildingsByThing(tdb_cassandra.View):
+    _use_db = True
+    _extra_schema_creation_args = {
+        "key_validation_class": UTF8_TYPE,
+        "column_name_class": UTF8_TYPE,
+    }
+
+    @classmethod
+    def get_gilder_ids(cls, thing):
+        columns = cls.get_time_sorted_columns(thing._fullname)
+        return [int(account_id, 36) for account_id in columns.iterkeys()]
+
+    @classmethod
+    def create(cls, user, things):
+        for thing in things:
+            cls._set_values(thing._fullname, {user._id36: ""})
+
+    @classmethod
+    def delete(cls, user, things):
+        # gildings cannot be undone
+        raise NotImplementedError()
+
+
+@view_of(GildedCommentsByAccount)
+@view_of(GildedLinksByAccount)
+class GildingsByDay(tdb_cassandra.View):
+    _use_db = True
+    _compare_with = TIME_UUID_TYPE
+    _extra_schema_creation_args = {
+        "key_validation_class": ASCII_TYPE,
+        "column_name_class": TIME_UUID_TYPE,
+        "default_validation_class": UTF8_TYPE,
+    }
+
+    @staticmethod
+    def _rowkey(date):
+        return date.strftime("%Y-%m-%d")
+
+    @classmethod
+    def get_gildings(cls, date):
+        key = cls._rowkey(date)
+        columns = cls.get_time_sorted_columns(key)
+        gildings = []
+        for name, json_blob in columns.iteritems():
+            timestamp = convert_uuid_to_time(name)
+            date = datetime.utcfromtimestamp(timestamp).replace(tzinfo=g.tz)
+
+            gilding = json.loads(json_blob)
+            gilding["date"] = date
+            gilding["user"] = int(gilding["user"], 36)
+            gildings.append(gilding)
+        return gildings
+
+    @classmethod
+    def create(cls, user, things):
+        key = cls._rowkey(datetime.now(g.tz))
+
+        columns = {}
+        for thing in things:
+            columns[uuid.uuid1()] = json.dumps({
+                "user": user._id36,
+                "thing": thing._fullname,
+            })
+        cls._set_values(key, columns)
+
+    @classmethod
+    def delete(cls, user, things):
+        # gildings cannot be undone
+        raise NotImplementedError()
 
 
 def create_unclaimed_gold (trans_id, payer_email, paying_id,
@@ -174,34 +266,6 @@ def create_unclaimed_gold (trans_id, payer_email, paying_id,
                 },
             ).execute()
 
-# TODO: this should really live in emailer.py
-def notify_unclaimed_gold(txn_id, gold_secret, payer_email, source):
-    from r2.lib import emailer
-    url = "http://www.reddit.com/thanks/" + gold_secret
-
-    # No point in i18n, since we don't have access to the user's
-    # language info (or name) at this point
-    if gold_secret.startswith("cr_"):
-        body = """
-Thanks for buying reddit gold gift creddits! We have received your %s
-transaction, number %s.
-
-Your secret claim code is %s. To associate the
-creddits with your reddit account, just visit
-%s
-""" % (source, txn_id, gold_secret, url)
-    else:
-        body = """
-Thanks for subscribing to reddit gold! We have received your %s
-transaction, number %s.
-
-Your secret subscription code is %s. You can use it to associate this
-subscription with your reddit account -- just visit
-%s
-""" % (source, txn_id, gold_secret, url)
-
-    emailer.gold_email(body, payer_email, "reddit gold subscriptions")
-
 
 def create_claimed_gold (trans_id, payer_email, paying_id,
                          pennies, days, secret, account_id, date,
@@ -217,17 +281,49 @@ def create_claimed_gold (trans_id, payer_email, paying_id,
                                 account_id=account_id,
                                 date=date)
 
-def create_gift_gold (giver_id, recipient_id, days, date, signed):
-    trans_id = "X%d%s-%s" % (int(time()), randstr(2), 'S' if signed else 'A')
 
-    gold_table.insert().execute(trans_id=trans_id,
-                                status="gift",
-                                paying_id=giver_id,
-                                payer_email='',
-                                pennies=0,
-                                days=days,
-                                account_id=recipient_id,
-                                date=date)
+def create_gift_gold(giver_id, recipient_id, days, date,
+            signed, note=None, gilding_type=None):
+    trans_id = "X%d%s-%s" % (int(time()), randstr(2), 'S' if signed else 'A')
+    gold_table.insert().execute(
+        trans_id=trans_id,
+        status="gift",
+        paying_id=giver_id,
+        payer_email='',
+        pennies=0,
+        days=days,
+        account_id=recipient_id,
+        date=date,
+        secret=note,
+        gilding_type=gilding_type,
+    )
+
+
+def create_gold_code(trans_id, payer_email, paying_id, pennies, days, date):
+    if not trans_id:
+        trans_id = "GC%d%s" % (int(time()), randstr(2))
+
+    valid_chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    # keep picking new codes until we find an unused one
+    while True:
+        code = randstr(10, alphabet=valid_chars)
+
+        s = sa.select([gold_table],
+                      sa.and_(gold_table.c.secret == code.lower(),
+                              gold_table.c.status == 'unclaimed'))
+        res = s.execute().fetchall()
+        if not res:
+            gold_table.insert().execute(
+                trans_id=trans_id,
+                status='unclaimed',
+                payer_email=payer_email,
+                paying_id=paying_id,
+                pennies=pennies,
+                days=days,
+                secret=code.lower(),
+                date=date)
+            return code
+
 
 def account_by_payingid(paying_id):
     s = sa.select([sa.distinct(gold_table.c.account_id)],
@@ -251,6 +347,7 @@ def claim_gold(secret, account_id):
     # The donation email has the code at the end of the sentence,
     # so they might get sloppy and catch the period or some whitespace.
     secret = secret.strip(". ")
+    secret = secret.replace("-", "").lower()
 
     rp = gold_table.update(sa.and_(gold_table.c.status == 'unclaimed',
                                    gold_table.c.secret == secret),
@@ -286,160 +383,10 @@ def check_by_email(email):
                           gold_table.c.payer_email == email)
     return s.execute().fetchall()
 
-# google checkout specific code:
-def new_google_transaction(trans_id):
-    # transid is in three parts: the actual ID, an identifier, and the status
-    key = trans_id.split('-')[0]
-    g.log.error("inserting %s" % key)
-    try:
-        gold_table.insert().execute(trans_id="g" + str(key),
-                                    subscr_id="",
-                                    status="uncharged",
-                                    payer_email="",
-                                    paying_id="",
-                                    pennies=0,
-                                    days=0,
-                                    secret=None,
-                                    date=datetime.now(g.tz))
-    except IntegrityError:
-        s = sa.select([gold_table.c.trans_id],
-                      sa.and_(gold_table.c.status == 'declined',
-                              gold_table.c.trans_id == "g" + str(key)))
-        res = s.execute().fetchall()
-        if res:
-            gold_table.update(gold_table.c.trans_id == "g" + str(key),
-                              values = { gold_table.c.status : 'uncharged' }
-                              ).execute()
-        else:
-            g.log.error("transaction id already exists in table: %s" % key)
 
-
-def _google_ordernum_request(ordernums):
-    d = Document()
-    n = d.createElement("notification-history-request")
-    n.setAttribute("xmlns", "http://checkout.google.com/schema/2")
-    d.appendChild(n)
-
-    on = d.createElement("order-numbers")
-    n.appendChild(on)
-
-    for num in tup(ordernums):
-        gon = d.createElement('google-order-number')
-        gon.appendChild(d.createTextNode("%s" % num))
-        on.appendChild(gon)
-
-    return _google_checkout_post(g.GOOGLE_REPORT_URL, d.toxml("UTF-8"))
-
-def _google_charge_and_ship(ordernum):
-    d = Document()
-    n = d.createElement("charge-and-ship-order")
-    n.setAttribute("xmlns", "http://checkout.google.com/schema/2")
-    n.setAttribute("google-order-number", ordernum)
-
-    d.appendChild(n)
-
-    return _google_checkout_post(g.GOOGLE_REQUEST_URL, d.toxml("UTF-8"))
-
-
-def _google_checkout_post(url, params):
-    u = urlparse("%s%s" % (url, g.GOOGLE_ID))
-    conn = HTTPSConnection(u.hostname, u.port)
-    auth = base64.encodestring('%s:%s' % (g.GOOGLE_ID, g.GOOGLE_KEY))[:-1]
-    headers = {"Authorization": "Basic %s" % auth,
-               "Content-type": "text/xml; charset=\"UTF-8\""}
-
-    conn.request("POST", u.path, params, headers)
-    response = conn.getresponse().read()
-    conn.close()
-
-    return BeautifulStoneSoup(response)
-
-
-def process_google_transaction(trans_id):
-    trans = _google_ordernum_request(trans_id)
-
-    # get the financial details
-    auth = trans.find("authorization-amount-notification")
-    
-    # creddits?
-    is_creddits = False
-    cart = trans.find("shopping-cart")
-    if cart:
-        for item in cart.findAll("item-name"):
-            if "creddit" in item.contents[0]:
-                is_creddits = True
-                break
-
-    if not auth:
-        # see if the payment was declinded
-        status = trans.findAll('financial-order-state')
-        if 'PAYMENT_DECLINED' in [x.contents[0] for x in status]:
-            g.log.error("google declined transaction found: '%s'" % trans_id)
-            rp = gold_table.update(
-                sa.and_(gold_table.c.status == 'uncharged',
-                        gold_table.c.trans_id == 'g' + str(trans_id)),
-                values = { gold_table.c.status : "declined" }).execute()
-        elif 'REVIEWING' not in [x.contents[0] for x in status]:
-            g.log.error("google transaction not found: '%s', status: %s"
-                        % (trans_id, [x.contents[0] for x in status]))
-    elif auth.find("financial-order-state").contents[0] == "CHARGEABLE":
-        email = str(auth.find("email").contents[0])
-        payer_id = str(auth.find('buyer-id').contents[0])
-        days = None
-        try:
-            pennies = int(float(auth.find("order-total").contents[0])*100)
-            if is_creddits:
-                secret = "cr_"
-                if pennies >= g.gold_year_price.pennies:
-                    days = 12 * 31 * int(pennies / g.gold_year_price.pennies)
-                else:
-                    days = 31 * int(pennies / g.gold_month_price.pennies)
-            elif pennies == g.gold_year_price.pennies:
-                secret = "ys_"
-                days = 366
-            elif pennies == g.gold_month_price.pennies:
-                secret = "m_"
-                days = 31
-            else:
-                g.log.error("Got %d pennies via Google?" % pennies)
-                rp = gold_table.update(
-                    sa.and_(gold_table.c.status == 'uncharged',
-                            gold_table.c.trans_id == 'g' + str(trans_id)),
-                    values = { gold_table.c.status : "strange",
-                               gold_table.c.pennies : pennies,
-                               gold_table.c.payer_email : email,
-                               gold_table.c.paying_id : payer_id
-                               }).execute()
-                return
-        except ValueError:
-            g.log.error("no amount in google checkout for transid %s"
-                     % trans_id)
-            return
-
-        secret += randstr(10)
-
-        # no point charging twice.  If we are in this func, the db doesn't
-        # know it was already charged so we still have to update and email
-        charged = trans.find("charge-amount-notification")
-        if not charged:
-            _google_charge_and_ship(trans_id)
-
-        create_unclaimed_gold("g" + str(trans_id),
-                              email, payer_id, pennies, days, str(secret),
-                              datetime.now(g.tz))
-
-        notify_unclaimed_gold(trans_id, secret, email, "Google")
-
-
-def process_uncharged():
-    s = sa.select([gold_table.c.trans_id],
-                 gold_table.c.status == 'uncharged')
-    res = s.execute().fetchall()
-
-    for trans_id, in res:
-        if trans_id.startswith('g'):
-            trans_id = trans_id[1:]
-            process_google_transaction(trans_id)
+def has_prev_subscr_payments(subscr_id):
+    s = sa.select([gold_table], gold_table.c.subscr_id == subscr_id)
+    return bool(s.execute().fetchall())
 
 
 def retrieve_gold_transaction(transaction_id):
@@ -452,3 +399,248 @@ def retrieve_gold_transaction(transaction_id):
 def update_gold_transaction(transaction_id, status):
     rp = gold_table.update(gold_table.c.trans_id == str(transaction_id),
                            values={gold_table.c.status: status}).execute()
+
+
+def transactions_by_user(user):
+    s = sa.select([gold_table], gold_table.c.account_id == str(user._id))
+    res = s.execute().fetchall()
+    return res
+
+
+def gold_payments_by_user(user):
+    transactions = transactions_by_user(user)
+
+    # filter out received gifts
+    transactions = [trans for trans in transactions
+                          if not trans.trans_id.startswith(('X', 'M'))]
+
+    return transactions
+
+
+def gold_received_by_user(user):
+    transactions = transactions_by_user(user)
+    transactions = [trans for trans in transactions
+                          if trans.trans_id.startswith('X')]
+    return transactions
+
+
+def days_to_pennies(days):
+    if days < 366:
+        months = days / 31
+        return months * g.gold_month_price.pennies
+    else:
+        years = days / 366
+        return years * g.gold_year_price.pennies
+
+
+def append_random_bottlecap_phrase(message):
+    """Appends a random "bottlecap" phrase from the wiki page.
+
+    The wiki page should be an unordered list with each item a separate
+    bottlecap.
+    """
+
+    bottlecap = None
+    try:
+        wp = WikiPage.get(Frontpage, g.wiki_page_gold_bottlecaps)
+
+        split_list = re.split('^[*-] ', wp.content, flags=re.MULTILINE)
+        choices = [item.strip() for item in split_list if item.strip()]
+        if len(choices):
+            bottlecap = choice(choices)
+    except NotFound:
+        pass
+
+    if bottlecap:
+        message += '\n\n> ' + bottlecap
+    return message
+
+
+def gold_revenue_multi(dates):
+    date_expr = sa.func.date_trunc('day',
+                    sa.func.timezone(TIMEZONE.zone, gold_table.c.date))
+    query = (select([date_expr, sa_sum(gold_table.c.pennies)])
+                .where(~ gold_table.c.status.in_(NON_REVENUE_STATUSES))
+                .where(date_expr.in_(dates))
+                .group_by(date_expr)
+            )
+    return {truncated_time.date(): pennies
+                for truncated_time, pennies in ENGINE.execute(query)}
+
+
+@memoize("gold-revenue-volatile", time=600, stale=True)
+def gold_revenue_volatile(date):
+    return gold_revenue_multi([date]).get(date, 0)
+
+
+@memoize("gold-revenue-steady", stale=True)
+def gold_revenue_steady(date):
+    return gold_revenue_multi([date]).get(date, 0)
+
+
+@memoize("gold-goal", stale=True)
+def gold_goal_on(date):
+    """Returns the gold revenue goal (in pennies) for a given date."""
+    goal = GoldRevenueGoalByDate.get(date)
+
+    if not goal:
+        return 0
+
+    return float(goal)
+
+
+def account_from_stripe_customer_id(stripe_customer_id):
+    q = Account._query(Account.c.gold_subscr_id == stripe_customer_id,
+                       Account.c._spam == (True, False), data=True)
+    return next(iter(q), None)
+
+
+@memoize("subscription-details", time=60)
+def _get_subscription_details(stripe_customer_id):
+    stripe.api_key = g.secrets['stripe_secret_key']
+    customer = stripe.Customer.retrieve(stripe_customer_id)
+
+    if getattr(customer, 'deleted', False):
+        return {}
+
+    subscription = customer.subscription
+    card = customer.active_card
+    end = datetime.fromtimestamp(subscription.current_period_end).date()
+    last4 = card.last4
+    pennies = subscription.plan.amount
+
+    return {
+        'next_charge_date': end,
+        'credit_card_last4': last4,
+        'pennies': pennies,
+    }
+
+
+def get_subscription_details(user):
+    if not getattr(user, 'gold_subscr_id', None):
+        return
+
+    return _get_subscription_details(user.gold_subscr_id)
+
+
+def paypal_subscription_url():
+    return "https://www.paypal.com/cgi-bin/webscr?cmd=_subscr-find&alias=%s" % g.goldpayment_email
+
+
+def get_discounted_price(gold_price):
+    discount = float(getattr(g, 'BTC_DISCOUNT', '0'))
+    price = (gold_price.pennies * (1 - discount)) / 100.
+    return GoldPrice("%.2f" % price)
+
+
+def make_gold_message(thing, user_gilded):
+    from r2.models import Comment
+
+    if thing.gildings == 0 or thing._spam or thing._deleted:
+        return None
+
+    author = Account._byID(thing.author_id, data=True)
+    if not author._deleted:
+        author_name = author.name
+    else:
+        author_name = _("[deleted]")
+
+    if c.user_is_loggedin and thing.author_id == c.user._id:
+        if isinstance(thing, Comment):
+            gilded_message = ungettext(
+                "a redditor gifted you a month of reddit gold for this "
+                "comment.",
+                "redditors have gifted you %(months)d months of reddit gold "
+                "for this comment.",
+                thing.gildings
+            )
+        else:
+            gilded_message = ungettext(
+                "a redditor gifted you a month of reddit gold for this "
+                "submission.",
+                "redditors have gifted you %(months)d months of reddit gold "
+                "for this submission.",
+                thing.gildings
+            )
+    elif user_gilded:
+        if isinstance(thing, Comment):
+            gilded_message = ungettext(
+                "you have gifted reddit gold to %(recipient)s for this "
+                "comment.",
+                "you and other redditors have gifted %(months)d months of "
+                "reddit gold to %(recipient)s for this comment.",
+                thing.gildings
+            )
+        else:
+            gilded_message = ungettext(
+                "you have gifted reddit gold to %(recipient)s for this "
+                "submission.",
+                "you and other redditors have gifted %(months)d months of "
+                "reddit gold to %(recipient)s for this submission.",
+                thing.gildings
+            )
+    else:
+        if isinstance(thing, Comment):
+            gilded_message = ungettext(
+                "a redditor has gifted reddit gold to %(recipient)s for this "
+                "comment.",
+                "redditors have gifted %(months)d months of reddit gold to "
+                "%(recipient)s for this comment.",
+                thing.gildings
+            )
+        else:
+            gilded_message = ungettext(
+                "a redditor has gifted reddit gold to %(recipient)s for this "
+                "submission.",
+                "redditors have gifted %(months)d months of reddit gold to "
+                "%(recipient)s for this submission.",
+                thing.gildings
+            )
+
+    return gilded_message % dict(
+        recipient=author_name,
+        months=thing.gildings,
+    )
+
+
+def creddits_lock(user):
+    return g.make_lock("gold_creddits", "creddits_%s" % user._id)
+
+
+PENNIES_PER_SERVER_SECOND = {
+    datetime.strptime(datestr, "%Y/%m/%d").date(): v
+    for datestr, v in g.live_config['pennies_per_server_second'].iteritems()
+}
+
+
+def calculate_server_seconds(pennies, date):
+    cutoff_dates = sorted(PENNIES_PER_SERVER_SECOND.keys())
+    date = to_date(date)
+    key = max(filter(lambda cutoff_date: date >= cutoff_date, cutoff_dates))
+    rate = PENNIES_PER_SERVER_SECOND[key]
+
+    # for simplicity all payment processor fees are $0.30 + 2.9%
+    net_pennies = pennies * (1 - 0.029) - 30
+
+    return net_pennies / rate
+
+
+def get_current_value_of_month():
+    price = g.gold_month_price.pennies
+    now = datetime.now(g.display_tz)
+    seconds = calculate_server_seconds(price, now)
+    return seconds
+
+
+class StylesheetsEverywhere(WikiPageIniItem):
+    @classmethod
+    def _get_wiki_config(cls):
+        return Frontpage, g.wiki_page_stylesheets_everywhere
+
+    def __init__(self, id, tagline, thumbnail_url, preview_url, is_enabled=True):
+        self.id = id
+        self.tagline = tagline
+        self.thumbnail_url = thumbnail_url
+        self.preview_url = preview_url
+        self.is_enabled = is_enabled
+        self.checked = False

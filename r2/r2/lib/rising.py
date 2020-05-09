@@ -16,54 +16,83 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from datetime import datetime
+import heapq
 
-from pylons import g
+from pylons import app_globals as g
 
 from r2.lib import count
+from r2.lib.sgm import sgm
 from r2.models.link import Link
 
 
-CACHE_KEY = "rising"
-
-
 def calc_rising():
-    sr_count = count.get_link_counts()
-    link_count = dict((k, v[0]) for k,v in sr_count.iteritems())
-    link_names = Link._by_fullname(sr_count.keys(), data=True)
+    link_counts = count.get_link_counts()
 
-    #max is half the average of the top 10 counts
-    counts = link_count.values()
-    counts.sort(reverse=True)
-    maxcount = sum(counts[:10]) / 20
+    links = Link._by_fullname(link_counts.keys(), data=True)
 
-    #prune the list
-    rising = [(n, link_names[n].sr_id)
-              for n in link_names.keys() if link_count[n] < maxcount]
+    def score(link):
+        count = link_counts[link._fullname][0]
+        return float(link._ups) / max(count, 1)
 
-    cur_time = datetime.now(g.tz)
+    # build the rising list, excluding items having 1 or less upvotes
+    rising = []
+    for link in links.values():
+        if link._ups > 1:
+            rising.append((link._fullname, score(link), link.sr_id))
 
-    def score(pair):
-        name = pair[0]
-        link = link_names[name]
-        hours = (cur_time - link._date).seconds / 3600 + 1
-        return float(link._ups) / (max(link_count[name], 1) * hours)
-
-    def r(x):
-        return 1 if x > 0 else -1 if x < 0 else 0
-
-    rising.sort(lambda x, y: r(score(y) - score(x)))
-    return rising
+    # return rising sorted by score
+    return sorted(rising, key=lambda x: x[1], reverse=True)
 
 
 def set_rising():
-    g.cache.set(CACHE_KEY, calc_rising())
+    g.gencache.set("all:rising", calc_rising())
+
+
+def get_all_rising():
+    return g.gencache.get("all:rising", [], stale=True)
 
 
 def get_rising(sr):
-    rising = g.cache.get(CACHE_KEY, [])
-    return [link for link, sr_id in rising if sr.keep_for_rising(sr_id)]
+    rising = get_all_rising()
+    return [link for link, score, sr_id in rising if sr.keep_for_rising(sr_id)]
+
+
+def get_rising_tuples(sr_ids):
+    rising = get_all_rising()
+
+    tuples_by_srid = {sr_id: [] for sr_id in sr_ids}
+    top_rising = {}
+
+    for link, score, sr_id in rising:
+        if sr_id not in sr_ids:
+            continue
+
+        if sr_id not in top_rising:
+            top_rising[sr_id] = score
+
+        norm_score = score / top_rising[sr_id]
+        tuples_by_srid[sr_id].append((-norm_score, -score, link))
+
+    return tuples_by_srid
+
+
+def normalized_rising(sr_ids):
+    if not sr_ids:
+        return []
+
+    tuples_by_srid = sgm(
+        cache=g.gencache,
+        keys=sr_ids,
+        miss_fn=get_rising_tuples,
+        prefix='rising:',
+        time=90,
+    )
+
+    merged = heapq.merge(*tuples_by_srid.values())
+
+    return [link_name for norm_score, score, link_name in merged]

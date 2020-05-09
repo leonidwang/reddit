@@ -16,211 +16,176 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from pylons import g, c
+from collections import defaultdict
 from itertools import chain
-from r2.lib.utils import SimpleSillyStub, tup, to36
-from r2.lib.db.sorts import epoch_seconds
-from r2.lib.cache import sgm
+
+from pylons import tmpl_context as c
+from pylons import app_globals as g
+
+from r2.lib.sgm import sgm
+from r2.lib.utils import tup
 from r2.models.comment_tree import CommentTree
-from r2.models.link import Comment, Link
+from r2.models.link import Comment, Link, CommentScoresByLink
 
-MAX_ITERATIONS = 50000
+MESSAGE_TREE_SIZE_LIMIT = 15000
 
-def comments_key(link_id):
-    return 'comments_' + str(link_id)
 
-def lock_key(link_id):
-    return 'comment_lock_' + str(link_id)
+def write_comment_scores(link, comments):
+    for sort in ("_controversy", "_confidence", "_score", "_qa"):
+        scores = calculate_comment_scores(link, sort, comments)
+        CommentScoresByLink.set_scores(link, sort, scores)
 
-def parent_comments_key(link_id):
-    return 'comments_parents_' + str(link_id)
-
-def sort_comments_key(link_id, sort):
-    assert sort.startswith('_')
-    return '%s%s' % (to36(link_id), sort)
-
-def _get_sort_value(comment, sort):
-    if sort == "_date":
-        return epoch_seconds(comment._date)
-    return getattr(comment, sort)
 
 def add_comments(comments):
-    links = Link._byID([com.link_id for com in tup(comments)], data=True)
+    """Add comments to the CommentTree and update scores."""
+    from r2.models.builder import write_comment_orders
+
+    link_ids = [comment.link_id for comment in tup(comments)]
+    links_by_id = Link._byID(link_ids)
+
     comments = tup(comments)
+    comments_by_link_id = defaultdict(list)
+    for comment in comments:
+        comments_by_link_id[comment.link_id].append(comment)
 
-    link_map = {}
-    for com in comments:
-        link_map.setdefault(com.link_id, []).append(com)
+    for link_id, link_comments in comments_by_link_id.iteritems():
+        link = links_by_id[link_id]
 
-    for link_id, coms in link_map.iteritems():
-        link = links[link_id]
-        timer = g.stats.get_timer('comment_tree.add.%s'
-                                  % link.comment_tree_version)
+        timer = g.stats.get_timer('comment_tree.add.1')
         timer.start()
-        try:
-            with CommentTree.mutation_context(link):
-                timer.intermediate('lock')
-                cache = get_comment_tree(link, timer=timer)
-                timer.intermediate('get')
-                cache.add_comments(coms)
-                timer.intermediate('update')
-        except:
-            g.log.exception(
-                'add_comments_nolock failed for link %s, recomputing tree',
-                link_id)
 
-            # calculate it from scratch
-            get_comment_tree(link, _update=True, timer=timer)
-        timer.stop()
-        update_comment_votes(coms)
+        write_comment_scores(link, link_comments)
+        timer.intermediate('scores')
 
-def update_comment_votes(comments, write_consistency_level = None):
-    from r2.models import CommentSortsCache
-
-    comments = tup(comments)
-
-    link_map = {}
-    for com in comments:
-        link_map.setdefault(com.link_id, []).append(com)
-
-    for link_id, coms in link_map.iteritems():
-        for sort in ("_controversy", "_hot", "_confidence", "_score", "_date"):
-            # Cassandra always uses the id36 instead of the integer
-            # ID, so we'll map that first before sending it
-            c_key = sort_comments_key(link_id, sort)
-            c_r = dict((cm._id36, _get_sort_value(cm, sort))
-                       for cm in coms)
-            CommentSortsCache._set_values(c_key, c_r,
-                                          write_consistency_level = write_consistency_level)
-
-def delete_comment(comment):
-    link = Link._byID(comment.link_id, data=True)
-    timer = g.stats.get_timer('comment_tree.delete.%s'
-                              % link.comment_tree_version)
-    timer.start()
-    with CommentTree.mutation_context(link):
-        timer.intermediate('lock')
-        cache = get_comment_tree(link)
-        timer.intermediate('get')
-        cache.delete_comment(comment, link)
+        CommentTree.add_comments(link, link_comments)
         timer.intermediate('update')
-        from r2.lib.db.queries import changed
-        changed([link])
-        timer.intermediate('changed')
-    timer.stop()
 
-def _comment_sorter_from_cids(cids, sort):
-    comments = Comment._byID(cids, data = False, return_dict = False)
-    return dict((x._id, _get_sort_value(x, sort)) for x in comments)
+        write_comment_orders(link)
+        timer.intermediate('write_order')
 
-def _get_comment_sorter(link_id, sort):
-    from r2.models import CommentSortsCache
-    from r2.lib.db.tdb_cassandra import NotFound
+        timer.stop()
 
-    key = sort_comments_key(link_id, sort)
-    try:
-        sorter = CommentSortsCache._byID(key)._values()
-    except NotFound:
+
+def calculate_comment_scores(link, sort, comments):
+    if sort in ("_controversy", "_confidence", "_score"):
+        scores = {
+            comment._id36: getattr(comment, sort)
+            for comment in comments
+        }
+    elif sort == "_qa":
+        comment_tree = CommentTree.by_link(link)
+        cid_tree = comment_tree.tree
+        scores = _calculate_qa_comment_scores(link, cid_tree, comments)
+    else:
+        raise ValueError("unsupported comment sort %s" % sort)
+
+    return scores
+
+
+def _calculate_qa_comment_scores(link, cid_tree, comments):
+    """Return a dict of comment_id36 -> qa score"""
+
+    # Responder is usually the OP, but there could be support for adding
+    # other answerers in the future.
+    responder_ids = link.responder_ids
+
+    # An OP response will change the sort value for its parent, so we need
+    # to process the parent, too.
+    parent_cids = []
+    for comment in comments:
+        if comment.author_id in responder_ids and comment.parent_id:
+            parent_cids.append(comment.parent_id)
+    parent_comments = Comment._byID(parent_cids, return_dict=False)
+    comments.extend(parent_comments)
+
+    # Fetch the comments in batch to avoid a bunch of separate calls down
+    # the line.
+    all_child_cids = []
+    for comment in comments:
+        child_cids = cid_tree.get(comment._id, None)
+        if child_cids:
+            all_child_cids.extend(child_cids)
+    all_child_comments = Comment._byID(all_child_cids)
+
+    comment_sorter = {}
+    for comment in comments:
+        child_cids = cid_tree.get(comment._id, ())
+        child_comments = (all_child_comments[cid] for cid in child_cids)
+        sort_value = comment._qa(child_comments, responder_ids)
+        comment_sorter[comment._id36] = sort_value
+
+    return comment_sorter
+
+
+def get_comment_scores(link, sort, comment_ids, timer):
+    """Retrieve cached sort values for all comments on a post.
+
+    Arguments:
+
+    * link_id -- id of the Link containing the comments.
+    * sort -- a string indicating the attribute on the comments to use for
+      generating sort values.
+
+    Returns a dictionary from cid to a numeric sort value.
+
+    """
+
+    from r2.lib.db import queries
+    from r2.models import CommentScoresByLink
+
+    if not comment_ids:
+        # no comments means no scores
         return {}
 
-    # we store these id36ed, but there are still bits of the code that
-    # want to deal in integer IDs
-    sorter = dict((int(c_id, 36), val)
-                  for (c_id, val) in sorter.iteritems())
-    return sorter
+    if sort == "_date":
+        # comment ids are monotonically increasing, so we can use them as a
+        # substitute for creation date
+        scores_by_id = {comment_id: comment_id for comment_id in comment_ids}
+    else:
+        scores_by_id36 = CommentScoresByLink.get_scores(link, sort)
 
-def link_comments_and_sort(link, sort):
-    from r2.models import CommentSortsCache
+        # we store these id36ed, but there are still bits of the code that
+        # want to deal in integer IDs
+        scores_by_id = {
+            int(id36, 36): score
+            for id36, score in scores_by_id36.iteritems()
+        }
 
-    # This has grown sort of organically over time. Right now the
-    # cache of the comments tree consists in three keys:
-    # 1. The comments_key: A tuple of
-    #      (cids, comment_tree, depth, num_children)
-    #    given:
-    #      cids         =:= [comment_id]
-    #      comment_tree =:= dict(comment_id -> [comment_id])
-    #      depth        =:= dict(comment_id -> int depth)
-    #      num_children =:= dict(comment_id -> int num_children)
-    # 2. The parent_comments_key =:= dict(comment_id -> parent_id)
-    # 3. The comments_sorts keys =:= dict(comment_id36 -> float).
-    #    These are represented by a Cassandra model
-    #    (CommentSortsCache) rather than a permacache key. One of
-    #    these exists for each sort (hot, new, etc)
+        scores_needed = set(comment_ids) - set(scores_by_id.keys())
+        if scores_needed:
+            # some scores were missing from CommentScoresByLink--lookup the
+            # comments and calculate the scores.
+            g.stats.simple_event('comment_tree_bad_sorter')
 
-    timer = g.stats.get_timer('comment_tree.get.%s' % link.comment_tree_version)
-    timer.start()
+            missing = Comment._byID(scores_needed, return_dict=False)
+            scores_by_missing_id36 = calculate_comment_scores(
+                link, sort, missing)
+            scores_by_missing = {
+                int(id36, 36): score
+                for id36, score in scores_by_missing_id36.iteritems()
+            }
 
-    link_id = link._id
-    cache = get_comment_tree(link, timer=timer)
-    cids = cache.cids
-    tree = cache.tree
-    depth = cache.depth
-    num_children = cache.num_children
-    parents = cache.parents
+            # up to once per minute write the scores to limit writes but
+            # eventually return us to the correct state.
+            if not g.disallow_db_writes:
+                write_key = "lock:score_{link}{sort}".format(
+                    link=link._id36,
+                    sort=sort,
+                )
+                should_write = g.lock_cache.add(write_key, "", time=60)
+                if should_write:
+                    CommentScoresByLink.set_scores(
+                        link, sort, scores_by_missing_id36)
 
-    # load the sorter
-    sorter = _get_comment_sorter(link_id, sort)
+            scores_by_id.update(scores_by_missing)
+            timer.intermediate('sort')
 
-    sorter_needed = []
-    if cids and not sorter:
-        sorter_needed = cids
-        g.log.debug("comment_tree.py: sorter (%s) cache miss for Link %s"
-                    % (sort, link_id))
-        sorter = {}
+    return scores_by_id
 
-    sorter_needed = [x for x in cids if x not in sorter]
-    if cids and sorter_needed:
-        g.log.debug(
-            "Error in comment_tree: sorter %r inconsistent (missing %d e.g. %r)"
-            % (sort_comments_key(link_id, sort), len(sorter_needed), sorter_needed[:10]))
-        if not g.disallow_db_writes:
-            update_comment_votes(Comment._byID(sorter_needed, data=True, return_dict=False))
-
-        sorter.update(_comment_sorter_from_cids(sorter_needed, sort))
-        timer.intermediate('sort')
-
-    if parents is None:
-        g.log.debug("comment_tree.py: parents cache miss for Link %s"
-                    % link_id)
-        parents = {}
-    elif cids and not all(x in parents for x in cids):
-        g.log.debug("Error in comment_tree: parents inconsistent for Link %s"
-                    % link_id)
-        parents = {}
-
-    if not parents and len(cids) > 0:
-        with CommentTree.mutation_context(link):
-            # reload under lock so the sorter and parents are consistent
-            timer.intermediate('lock')
-            cache = get_comment_tree(link, timer=timer)
-            cache.parents = cache.parent_dict_from_tree(cache.tree)
-
-    timer.stop()
-
-    return (cache.cids, cache.tree, cache.depth, cache.num_children,
-            cache.parents, sorter)
-
-def get_comment_tree(link, _update=False, timer=None):
-    if timer is None:
-        timer = SimpleSillyStub()
-    cache = CommentTree.by_link(link)
-    timer.intermediate('load')
-    if cache and not _update:
-        return cache
-    with CommentTree.mutation_context(link, timeout=180):
-        timer.intermediate('lock')
-        cache = CommentTree.rebuild(link)
-        timer.intermediate('rebuild')
-        # the tree rebuild updated the link's comment count, so schedule it for
-        # search reindexing
-        from r2.lib.db.queries import changed
-        changed([link])
-        timer.intermediate('changed')
-        return cache
 
 # message conversation functions
 def messages_key(user_id):
@@ -229,19 +194,23 @@ def messages_key(user_id):
 def messages_lock_key(user_id):
     return 'message_conversations_lock_' + str(user_id)
 
-def add_message(message):
-    # add the message to the author's list and the recipient
+def add_message(message, update_recipient=True, update_modmail=True,
+                add_to_user=None):
     with g.make_lock("message_tree", messages_lock_key(message.author_id)):
         add_message_nolock(message.author_id, message)
-    if message.to_id:
+
+    if (update_recipient and message.to_id and
+            message.to_id != message.author_id):
         with g.make_lock("message_tree", messages_lock_key(message.to_id)):
             add_message_nolock(message.to_id, message)
-    # Messages to a subreddit should end in its inbox. Messages
-    # FROM a subreddit (currently, just ban messages) should NOT
-    if message.sr_id and not message.from_sr:
+
+    if update_modmail and message.sr_id:
         with g.make_lock("modmail_tree", sr_messages_lock_key(message.sr_id)):
             add_sr_message_nolock(message.sr_id, message)
 
+    if add_to_user and add_to_user._id != message.to_id:
+        with g.make_lock("message_tree", messages_lock_key(add_to_user._id)):
+            add_message_nolock(add_to_user._id, message)
 
 def _add_message_nolock(key, message):
     from r2.models import Account, Message
@@ -274,6 +243,13 @@ def _add_message_nolock(key, message):
             if new_tree:
                 trees.append(new_tree[0])
         trees.sort(key = tree_sort_fn, reverse = True)
+
+    # If we have too many messages in the tree, drop the oldest
+    # conversation to avoid the permacache size limit
+    tree_size = len(trees) + sum(len(convo[1]) for convo in trees)
+
+    if tree_size > MESSAGE_TREE_SIZE_LIMIT:
+        del trees[-1]
 
     # done!
     g.permacache.set(key, trees)
@@ -314,11 +290,6 @@ def user_messages(user, update = False):
         g.permacache.set(key, trees)
     return trees
 
-def _process_message_query(inbox):
-    if hasattr(inbox, 'prewrap_fn'):
-        return [inbox.prewrap_fn(i) for i in inbox]
-    return list(inbox)
-
 
 def _load_messages(mlist):
     from r2.models import Message
@@ -334,8 +305,8 @@ def user_messages_nocache(user):
     Just like user_messages, but avoiding the cache
     """
     from r2.lib.db import queries
-    inbox = _process_message_query(queries.get_inbox_messages(user))
-    sent = _process_message_query(queries.get_sent(user))
+    inbox = queries.get_inbox_messages(user)
+    sent = queries.get_sent(user)
     messages = _load_messages(list(chain(inbox, sent)))
     return compute_message_trees(messages)
 
@@ -379,7 +350,7 @@ def subreddit_messages_nocache(sr):
     Just like user_messages, but avoiding the cache
     """
     from r2.lib.db import queries
-    inbox = _process_message_query(queries.get_subreddit_messages(sr))
+    inbox = queries.get_subreddit_messages(sr)
     messages = _load_messages(inbox)
     return compute_message_trees(messages)
 
@@ -400,8 +371,6 @@ def compute_message_trees(messages):
     messages = sorted(messages, key = lambda m: m._date, reverse = True)
 
     for m in messages:
-        if not m._loaded:
-            m._load()
         mdict[m._id] = m
         if m.first_message:
             roots.add(m.first_message)
@@ -429,7 +398,7 @@ def tree_sort_fn(tree):
     return threads[-1] if threads else root
 
 def _populate(after_id = None, estimate=54301242):
-    from r2.models import CommentSortsCache, desc
+    from r2.models import desc
     from r2.lib.db import tdb_cassandra
     from r2.lib import utils
 
@@ -449,4 +418,4 @@ def _populate(after_id = None, estimate=54301242):
 
     for chunk in utils.in_chunks(q, chunk_size):
         chunk = filter(lambda x: hasattr(x, 'link_id'), chunk)
-        update_comment_votes(chunk, write_consistency_level = tdb_cassandra.CL.ONE)
+        add_comments(chunk)

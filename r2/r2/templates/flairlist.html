@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -26,10 +26,10 @@
   <%utils:line_field title="${_('jump to user (or add):')}" css_class="flair-jump">
     <form method="get">
       <% name = thing.user.name if thing.user else thing.name %>
-      <input type="text" maxlength="32" id="flair_jump_name" name="name"
+      <input type="text" maxlength="20" id="flair_jump_name" name="name"
              value="${name}">
       <button type="submit">${_('go')}</button>
-      ${utils.error_field(('USER_DOESNT_EXIST', 'name'), 'name')}
+      ${utils.error_field('USER_DOESNT_EXIST', 'name')}
     </form>
     %if thing.user or thing.name:
         ${utils.plain_link(_('back to full list'), '/about/flair',

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -24,7 +24,11 @@ import subprocess
 import tempfile
 import difflib
 from pylons.i18n import _
-from pylons import g
+from pylons import app_globals as g
+
+
+MAX_DIFF_LINE_LENGTH = 4000
+
 
 class ConflictException(Exception):
     def __init__(self, new, your, original):
@@ -37,10 +41,16 @@ class ConflictException(Exception):
 
 def make_htmldiff(a, b, adesc, bdesc):
     diffcontent = difflib.HtmlDiff(wrapcolumn=60)
-    return diffcontent.make_table(a.splitlines(),
-                                  b.splitlines(),
+
+    def truncate(line):
+        if len(line) > MAX_DIFF_LINE_LENGTH:
+            line = line[:MAX_DIFF_LINE_LENGTH] + "..."
+        return line
+    return diffcontent.make_table([truncate(i) for i in a.splitlines()],
+                                  [truncate(i) for i in b.splitlines()],
                                   fromdesc=adesc,
-                                  todesc=bdesc)
+                                  todesc=bdesc,
+                                  context=3)
 
 def threewaymerge(original, a, b):
     temp_dir = g.diff3_temp_location if g.diff3_temp_location else None

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -30,28 +30,39 @@ def api(type, cls):
     tpm.add_handler(type, 'api-html', cls())
     tpm.add_handler(type, 'api-compact', cls())
 
+
+def register_api_templates(template_name, template_class):
+    for style in ('api', 'api-html', 'api-compact'):
+        tpm.add_handler(
+            name=template_name,
+            style=style,
+            handler=template_class,
+        )
+
+
 # blanket fallback rule
 api('templated', NullJsonTemplate)
 
 # class specific overrides
 api('link',          LinkJsonTemplate)
 api('promotedlink',  PromotedLinkJsonTemplate)
-api('comment',       CommentJsonTemplate)
 api('message',       MessageJsonTemplate)
 api('subreddit',     SubredditJsonTemplate)
 api('labeledmulti',  LabeledMultiJsonTemplate)
-api('morerecursion', MoreCommentJsonTemplate)
-api('morechildren',  MoreCommentJsonTemplate)
 api('reddit',        RedditJsonTemplate)
 api('panestack',     PanestackJsonTemplate)
+api('htmlpanestack', NullJsonTemplate)
 api('listing',       ListingJsonTemplate)
-api('modlist',       UserListJsonTemplate)
-api('userlist',      UserListJsonTemplate)
-api('contributorlist', UserListJsonTemplate)
-api('bannedlist',    UserListJsonTemplate)
-api('friendlist',    UserListJsonTemplate)
+api('searchlisting', SearchListingJsonTemplate)
+api('userlisting',   UserListingJsonTemplate)
 api('usertableitem', UserTableItemJsonTemplate)
 api('account',       AccountJsonTemplate)
+
+api('reltableitem', RelTableItemJsonTemplate)
+api('bannedtableitem', BannedTableItemJsonTemplate)
+api('mutedtableitem', MutedTableItemJsonTemplate)
+api('invitedmodtableitem', InvitedModTableItemJsonTemplate)
+api('friendtableitem', FriendTableItemJsonTemplate)
 
 api('organiclisting',       OrganicListingJsonTemplate)
 api('subreddittraffic', TrafficJsonTemplate)
@@ -69,11 +80,19 @@ api('wikipagesettings', WikiSettingsJsonTemplate)
 
 api('flairlist', FlairListJsonTemplate)
 api('flaircsv', FlairCsvJsonTemplate)
+api('flairselector', FlairSelectorJsonTemplate)
 
 api('subredditstylesheet', StylesheetTemplate)
 api('subredditstylesheetsource', StylesheetTemplate)
 api('createsubreddit', SubredditSettingsTemplate)
+api('uploadedimage', UploadedImageJsonTemplate)
 
 api('modaction', ModActionTemplate)
 
-tpm.add_handler('usertableitem', 'api-html', UserItemHTMLJsonTemplate())
+api('trophy', TrophyJsonTemplate)
+api('rules', RulesJsonTemplate)
+
+
+register_api_templates('comment', CommentJsonTemplate)
+register_api_templates('morerecursion', MoreCommentJsonTemplate)
+register_api_templates('morechildren', MoreCommentJsonTemplate)

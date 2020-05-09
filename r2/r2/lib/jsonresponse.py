@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -30,7 +30,8 @@ from r2.lib.pages.things import wrap_links
 from r2.models import IDBuilder, Listing
 
 import simplejson
-from pylons import c, g
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 
 
 class JsonResponse(object):
@@ -199,7 +200,8 @@ class JQueryResponse(JsonResponse):
                 selector += ".field-" + field_name
             message = c.errors[(error_name, field_name)].message
             form.find(selector).show().text(message).end()
-        return {"jquery": self.ops}
+        return {"jquery": self.ops,
+                "success": not self.has_error()}
 
     # thing methods
     #--------------
@@ -211,7 +213,7 @@ class JQueryResponse(JsonResponse):
 
     def insert_table_rows(self, rows, index = -1):
         new = self.__getattr__("insert_table_rows")
-        return new([row.render() for row in tup(rows)], index)
+        return new([row.render(style='html') for row in tup(rows)], index)
 
 
     # convenience methods:
@@ -232,7 +234,9 @@ class JQueryResponse(JsonResponse):
 
     def set_inputs(self, **kw):
         for k, v in kw.iteritems():
-            self.get_input(k).set(value = v).end()
+            # Using 'val' instead of setting the 'value' attribute allows this
+            # To work for non-textbox inputs, like textareas
+            self.get_input(k).val(v).end()
         return self
 
     def focus_input(self, name):
@@ -243,6 +247,10 @@ class JQueryResponse(JsonResponse):
             return self.find(selector).show().html(value).end()
         return self.find(selector).hide().html("").end()
 
+    def set_text(self, selector, value):
+        if value:
+            return self.find(selector).show().text(value).end()
+        return self.find(selector).hide().html("").end()
 
     def set(self, **kw):
         obj = self

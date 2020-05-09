@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -25,37 +25,54 @@ For talking to authorize.net credit card payments via their XML api.
 
 This file consists mostly of wrapper classes for dealing with their
 API, while the actual useful functions live in interaction.py
+
+NOTE: This is using the Customer Information Manager (CIM) API
+http://developer.authorize.net/api/cim/
 """
 
 import re
-import socket
 from httplib import HTTPSConnection
 from urlparse import urlparse
 
 from BeautifulSoup import BeautifulStoneSoup
-from pylons import g
+from pylons import app_globals as g
 from xml.sax.saxutils import escape
 
 from r2.lib.export import export
 from r2.lib.utils import iters, Storage
-from r2.models.bidding import CustomerID, PayID, ShippingAddress
 
-__all__ = ["PROFILE_LIMIT"]
+__all__ = ["PROFILE_LIMIT", "TRANSACTION_NOT_FOUND"]
+
+TRANSACTION_NOT_FOUND = 16
+
+# response codes http://www.authorize.net/support/ReportingGuide_XML.pdf
+TRANSACTION_APPROVED = 1
+TRANSACTION_DECLINED = 2
+TRANSACTION_ERROR = 3
+TRANSACTION_IN_REVIEW = 4
+
+# response reason codes
+TRANSACTION_DUPLICATE = 11
+# transactions with identical amount, credit card, and invoice submitted within
+# some time window will raise an error
+# https://support.authorize.net/authkb/index?page=content&id=A425
 
 
 # list of the most common errors.
-Errors = Storage(TESTMODE="E00009",
-                 TRANSACTION_FAIL="E00027",
-                 DUPLICATE_RECORD="E00039", 
-                 RECORD_NOT_FOUND="E00040",
-                 TOO_MANY_PAY_PROFILES="E00042",
-                 TOO_MANY_SHIP_ADDRESSES="E00043")
+Errors = Storage(
+    TRANSACTION_FAIL="E00027",
+    DUPLICATE_RECORD="E00039", 
+    RECORD_NOT_FOUND="E00040",
+    TOO_MANY_PAY_PROFILES="E00042",
+    TOO_MANY_SHIP_ADDRESSES="E00043",
+)
 
 PROFILE_LIMIT = 10 # max payment profiles per user allowed by authorize.net
 
+
 @export
 class AuthorizeNetException(Exception):
-    def __init__(self, msg):
+    def __init__(self, msg, code=None):
         # don't let CC info show up in logs
         msg = re.sub("<cardNumber>\d+(\d{4})</cardNumber>", 
                      "<cardNumber>...\g<1></cardNumber>",
@@ -63,8 +80,24 @@ class AuthorizeNetException(Exception):
         msg = re.sub("<cardCode>\d+</cardCode>",
                      "<cardCode>omitted</cardCode>",
                      msg)
+        self.code = code
         super(AuthorizeNetException, self).__init__(msg)
 
+
+class TransactionError(Exception):
+    def __init__(self, message):
+        self.message = message
+
+
+class DuplicateTransactionError(TransactionError):
+    def __init__(self, transaction_id):
+        self.transaction_id = transaction_id
+        message = ('DuplicateTransactionError with transaction_id %d' %
+                   transaction_id)
+        super(DuplicateTransactionError, self).__init__(message)
+
+
+class AuthorizationHoldNotFound(Exception): pass
 
 
 # xml tags whose content shouldn't be escaped 
@@ -160,35 +193,40 @@ class CreditCard(SimpleXMLObject):
 
 
 class Profile(SimpleXMLObject):
-    """
-    Converts a user into a Profile object.
-    """
     _keys = ["merchantCustomerId", "description",
-             "email", "customerProfileId", "paymentProfiles", "shipToList",
-             "validationMode"]
-    def __init__(self, user, paymentProfiles, address,
-                 validationMode=None):
-        SimpleXMLObject.__init__(self, merchantCustomerId=user._fullname,
-                                 description=user.name, email="",
-                                 paymentProfiles=paymentProfiles,
-                                 shipToList=address,
-                                 validationMode=validationMode,
-                                 customerProfileId=CustomerID.get_id(user))
+             "email", "customerProfileId", "paymentProfiles", "validationMode"]
+
+    def __init__(self, description, merchantCustomerId, customerProfileId,
+                 paymentProfiles, validationMode=None):
+        SimpleXMLObject.__init__(
+            self,
+            merchantCustomerId=merchantCustomerId,
+            description=description,
+            email="",
+            paymentProfiles=paymentProfiles,
+            validationMode=validationMode,
+            customerProfileId=customerProfileId,
+        )
+
 
 class PaymentProfile(SimpleXMLObject):
     _keys = ["billTo", "payment", "customerPaymentProfileId", "validationMode"]
-    def __init__(self, billTo, card, paymentId=None,
+    def __init__(self, billTo, card, customerPaymentProfileId=None,
                  validationMode=None):
-        SimpleXMLObject.__init__(self, billTo=billTo,
-                                 customerPaymentProfileId=paymentId,
-                                 payment=SimpleXMLObject(creditCard=card),
-                                 validationMode=validationMode)
+        SimpleXMLObject.__init__(
+            self,
+            billTo=billTo,
+            customerPaymentProfileId=customerPaymentProfileId,
+            payment=SimpleXMLObject(creditCard=card),
+            validationMode=validationMode,
+        )
 
     @classmethod
     def fromXML(cls, res):
-        payid = int(res.customerpaymentprofileid.contents[0])
-        return cls(Address.fromXML(res.billto),
-                   CreditCard.fromXML(res.payment), payid)
+        paymentId = int(res.customerpaymentprofileid.contents[0])
+        billTo = Address.fromXML(res.billto)
+        card = CreditCard.fromXML(res.payment)
+        return cls(billTo, card, paymentId)
 
 
 @export
@@ -200,21 +238,15 @@ class Transaction(SimpleXMLObject):
     _keys = ["amount", "customerProfileId", "customerPaymentProfileId",
              "transId", "order"]
 
-    def __init__(self, amount, profile_id, pay_id, trans_id=None,
-                 order=None):
-        SimpleXMLObject.__init__(self, amount=amount,
-                                 customerProfileId=profile_id,
-                                 customerPaymentProfileId=pay_id,
-                                 transId=trans_id,
-                                 order=order)
+    def __init__(self, amount, customerProfileId, customerPaymentProfileId,
+                 transId=None, order=None):
+        SimpleXMLObject.__init__(
+            self, amount=amount, customerProfileId=customerProfileId,
+            customerPaymentProfileId=customerPaymentProfileId, transId=transId,
+            order=order)
 
     def _wrapper(self, content):
         return self.simple_tag(self._name(), content)
-
-
-# authorize and charge
-@export
-class ProfileTransAuthCapture(Transaction): pass
 
 
 # only authorize (no charge is made)
@@ -225,11 +257,6 @@ class ProfileTransAuthOnly(Transaction): pass
 # charge only (requires previous auth_only)
 @export
 class ProfileTransPriorAuthCapture(Transaction): pass
-
-
-# stronger than above: charge even on decline (not sure why you would want to)
-@export
-class ProfileTransCaptureOnly(Transaction): pass
 
 
 # refund a transaction
@@ -248,8 +275,8 @@ class AuthorizeNetRequest(SimpleXMLObject):
 
     @property
     def merchantAuthentication(self):
-        return Auth(name=g.authorizenetname,
-                    transactionKey=g.authorizenetkey)
+        return Auth(name=g.secrets['authorizenetname'],
+                    transactionKey=g.secrets['authorizenetkey'])
 
     def _wrapper(self, content):
         return ('<?xml version="1.0" encoding="utf-8"?>' +
@@ -258,25 +285,17 @@ class AuthorizeNetRequest(SimpleXMLObject):
 
     def make_request(self):
         u = urlparse(g.authorizenetapi)
-        try:
-            conn = HTTPSConnection(u.hostname, u.port)
-            conn.request("POST", u.path, self.toXML().encode('utf-8'),
-                         {"Content-type": "text/xml"})
-            res = conn.getresponse()
-            res = self.handle_response(res.read())
-            conn.close()
-            return res
-        except socket.error:
-            return False
+        conn = HTTPSConnection(u.hostname, u.port)
+        conn.request("POST", u.path, self.toXML().encode('utf-8'),
+                     {"Content-type": "text/xml"})
+        res = conn.getresponse()
+        res = self.handle_response(res.read())
+        conn.close()
+        return res
 
     def is_error_code(self, res, code):
         return (res.message.code and res.message.code.contents and
                 res.message.code.contents[0] == code)
-
-
-    def process_error(self, res):
-        msg = "Response %r from request %r" % (res, self.toXML())
-        raise AuthorizeNetException(msg)
 
     _autoclose_re = re.compile("<([^/]+)/>")
     def _autoclose_handler(self, m):
@@ -295,285 +314,132 @@ class AuthorizeNetRequest(SimpleXMLObject):
     def process_response(self, res):
         raise NotImplementedError
 
-class CustomerRequest(AuthorizeNetRequest):
-    _keys = AuthorizeNetRequest._keys + ["customerProfileId"]
-    def __init__(self, user, **kw):
-        if isinstance(user, int):
-            cust_id = user
-            self._user = None
-        else:
-            cust_id = CustomerID.get_id(user)
-            self._user = user
-        AuthorizeNetRequest.__init__(self, customerProfileId=cust_id, **kw)
+    def process_error(self, res):
+        raise NotImplementedError
+
 
 # --- real request classes below
 
-
 class CreateCustomerProfileRequest(AuthorizeNetRequest):
-    """
-    Create a new user object on authorize.net and return the new object ID.
-
-    Handles the case of already existing users on either end
-    gracefully and will update the Account object accordingly.
-    """
     _keys = AuthorizeNetRequest._keys + ["profile", "validationMode"]
 
-    def __init__(self, user, validationMode=None):
-        # cache the user object passed in
-        self._user = user
-        AuthorizeNetRequest.__init__(self,
-                                     profile=Profile(user, None, None), 
-                                     validationMode=validationMode)
+    def __init__(self, profile, validationMode=None):
+        AuthorizeNetRequest.__init__(
+            self, profile=profile, validationMode=validationMode)
 
     def process_response(self, res):
         customer_id = int(res.customerprofileid.contents[0])
-        CustomerID.set(self._user, customer_id)
         return customer_id
 
-    def make_request(self):
-        # don't send a new request if the user already has an id
-        return (CustomerID.get_id(self._user) or
-                AuthorizeNetRequest.make_request(self))
-
-    re_lost_id = re.compile("A duplicate record with ID (\d+) already exists")
     def process_error(self, res):
+        message_text = res.find("text").contents[0]
+
         if self.is_error_code(res, Errors.DUPLICATE_RECORD):
-            # authorize.net has a record for this customer but we don't. get
-            # the correct id from the error message and update our db
-            matches = self.re_lost_id.match(res.find("text").contents[0])
+            # authorize.net has a record for this user but we don't. get the id
+            # from the error message
+            matches = re.match(
+                "A duplicate record with ID (\d+) already exists", message_text)
             if matches:
                 match_groups = matches.groups()
-                CustomerID.set(self._user, match_groups[0])
-                g.log.debug("Updated missing authorize.net id for user %s" % self._user._id)
-            else:
-                # could happen if the format of the error message changes.
-                msg = ("Failed to fix duplicate authorize.net profile id. "
-                       "re_lost_id regexp may need to be updated. Response: %r" 
-                       % res)
-                raise AuthorizeNetException(msg)
-        # otherwise, we might have sent a user that already had a customer ID
-        cust_id = CustomerID.get_id(self._user)
-        if cust_id:
-            return cust_id
-        return AuthorizeNetRequest.process_error(self, res)
+                customer_id = match_groups[0]
+                return customer_id
+
+        raise AuthorizeNetException(message_text)
 
 
-class CreateCustomerPaymentProfileRequest(CustomerRequest):
-    """
-    Adds a payment profile to an existing user object.  The profile
-    includes a valid address and a credit card number.
-    """
-    _keys = (CustomerRequest._keys + ["paymentProfile", "validationMode"])
+class CreateCustomerPaymentProfileRequest(AuthorizeNetRequest):
+    _keys = AuthorizeNetRequest._keys + ["customerProfileId", "paymentProfile",
+        "validationMode"]
 
-    def __init__(self, user, address, creditcard, validationMode=None):
-        CustomerRequest.__init__(self, user,
-                                 paymentProfile=PaymentProfile(address,
-                                                               creditcard),
-                                 validationMode=validationMode)
+    def __init__(self, customerProfileId, paymentProfile, validationMode=None):
+        AuthorizeNetRequest.__init__(
+            self, customerProfileId=customerProfileId,
+            paymentProfile=paymentProfile, validationMode=validationMode)
 
     def process_response(self, res):
         pay_id = int(res.customerpaymentprofileid.contents[0])
-        PayID.add(self._user, pay_id)
         return pay_id
 
     def process_error(self, res):
-        if self.is_error_code(res, Errors.DUPLICATE_RECORD):
-            u, data = GetCustomerProfileRequest(self._user).make_request()
-            profiles = data.paymentProfiles
-            if len(profiles) == 1:
-                return profiles[0].customerPaymentProfileId
-            return
-        return CustomerRequest.process_error(self, res)
+        message_text = res.find("text").contents[0]
+        raise AuthorizeNetException(message_text)
 
 
-class CreateCustomerShippingAddressRequest(CustomerRequest):
-    """
-    Adds a shipping address.
-    """
-    _keys = CustomerRequest._keys + ["address"]
-    def process_response(self, res):
-        pay_id = int(res.customeraddressid.contents[0])
-        ShippingAddress.add(self._user, pay_id)
-        return pay_id
+class GetCustomerProfileRequest(AuthorizeNetRequest):
+    _keys = AuthorizeNetRequest._keys + ["customerProfileId"]
 
-    def process_error(self, res):
-        if self.is_error_code(res, Errors.DUPLICATE_RECORD):
-            return
-        return CustomerRequest.process_error(self, res)
-
-
-class GetCustomerPaymentProfileRequest(CustomerRequest):
-    _keys = CustomerRequest._keys + ["customerPaymentProfileId"]
-    """
-    Gets a payment profile by user Account object and authorize.net
-    profileid of the payment profile.
-
-    Error handling: make_request returns None if the id generates a
-    RECORD_NOT_FOUND error from the server.  The user object is
-    cleaned up in either case; if the user object lacked the (valid)
-    pay id, it is added to its list, while if the pay id is invalid,
-    it is removed from the user object.
-    """
-    def __init__(self, user, profileid):
-        CustomerRequest.__init__(self, user,
-                                 customerPaymentProfileId=profileid)
-    def process_response(self, res):
-        # add the id to the user object in case something has gone wrong
-        PayID.add(self._user, self.customerPaymentProfileId)
-        return PaymentProfile.fromXML(res.paymentprofile)
-
-    def process_error(self, res):
-        if self.is_error_code(res, Errors.RECORD_NOT_FOUND):
-            PayID.delete(self._user, self.customerPaymentProfileId)
-        return CustomerRequest.process_error(self, res)
-
-
-class GetCustomerShippingAddressRequest(CustomerRequest):
-    """
-    Same as GetCustomerPaymentProfileRequest except with shipping addresses.
-
-    Error handling is identical.
-    """
-    _keys = CustomerRequest._keys + ["customerAddressId"]
-    def __init__(self, user, shippingid):
-        CustomerRequest.__init__(self, user,
-                                 customerAddressId=shippingid)
+    def __init__(self, customerProfileId):
+        AuthorizeNetRequest.__init__(
+            self, customerProfileId=customerProfileId)
 
     def process_response(self, res):
-        # add the id to the user object in case something has gone wrong
-        ShippingAddress.add(self._user, self.customerAddressId)
-        return Address.fromXML(res.address)
+        merchantCustomerId = res.merchantcustomerid.contents[0]
+        description = res.description.contents[0]
+        profile_id = int(res.customerprofileid.contents[0])
 
-    def process_error(self, res):
-        if self.is_error_code(res, Errors.RECORD_NOT_FOUND):
-            ShippingAddress.delete(self._user, self.customerAddressId)
-        return CustomerRequest.process_error(self, res)
- 
-
-class GetCustomerProfileIdsRequest(AuthorizeNetRequest):
-    """
-    Get a list of all customer ids that have been recorded with
-    authorize.net
-    """
-    def process_response(self, res):
-        return [int(x.contents[0]) for x in res.ids.findAll('numericstring')]
-
-
-class GetCustomerProfileRequest(CustomerRequest): 
-    """
-    Given a user, find their customer information.
-    """
-    def process_response(self, res):
-        from r2.models import Account
-        fullname = res.merchantcustomerid.contents[0]
-        name = res.description.contents[0]
-        customer_id = int(res.customerprofileid.contents[0])
-        acct = Account._by_name(name)
-
-        # make sure we are updating the correct account!
-        if acct.name == name:
-            CustomerID.set(acct, customer_id)
-        else:
-            raise AuthorizeNetException, \
-                  "account name doesn't match authorize.net account"
-
-        # parse the ship-to list, and make sure the Account is up todate
-        ship_to = []
-        for profile in res.findAll("shiptolist"):
-            a = Address.fromXML(profile)
-            ShippingAddress.add(acct, a.customerAddressId)
-            ship_to.append(a)
-
-        # parse the payment profiles, and ditto
-        profiles = []
+        payment_profiles = []
         for profile in res.findAll("paymentprofiles"):
-            a = Address.fromXML(profile)
-            cc = CreditCard.fromXML(profile.payment)
-            payprof = PaymentProfile(a, cc, int(a.customerPaymentProfileId))
-            PayID.add(acct, a.customerPaymentProfileId)
-            profiles.append(payprof)
+            address = Address.fromXML(profile)
+            credit_card = CreditCard.fromXML(profile.payment)
+            customerPaymentProfileId = int(address.customerPaymentProfileId)
 
-        return acct, Profile(acct, profiles, ship_to)
-    
-class DeleteCustomerProfileRequest(CustomerRequest):
-    """
-    Delete a customer shipping address
-    """
-    def process_response(self, res):
-        if self._user:
-            CustomerID.delete(self._user)
-        return 
+            payment_profile = PaymentProfile(
+                billTo=address,
+                card=credit_card,
+                customerPaymentProfileId=customerPaymentProfileId,
+            )
+            payment_profiles.append(payment_profile)
+
+        profile = Profile(
+            description=description,
+            merchantCustomerId=merchantCustomerId,
+            customerProfileId=profile_id,
+            paymentProfiles=payment_profiles,
+        )
+        return profile
 
     def process_error(self, res):
-        if self.is_error_code(res, Errors.RECORD_NOT_FOUND):
-            CustomerID.delete(self._user)
-        return CustomerRequest.process_error(self, res)
+        message_text = res.find("text").contents[0]
+        code = res.find('code').contents[0]
+        raise AuthorizeNetException(message_text, code=code)
 
 
-class DeleteCustomerPaymentProfileRequest(GetCustomerPaymentProfileRequest):
-    """
-    Delete a customer shipping address
-    """
+# TODO: implement
+class DeleteCustomerPaymentProfileRequest(AuthorizeNetRequest):
+    _keys = AuthorizeNetRequest._keys + ["customerProfileId",
+        "customerPaymentProfileId"]
+
+    def __init__(self, customerProfileId, customerPaymentProfileId):
+        AuthorizeNetRequest.__init__(
+            self, customerProfileId=customerProfileId,
+            customerPaymentProfileId=customerPaymentProfileId)
+
     def process_response(self, res):
-        PayID.delete(self._user, self.customerPaymentProfileId)
         return True
 
     def process_error(self, res):
         if self.is_error_code(res, Errors.RECORD_NOT_FOUND):
-            PayID.delete(self._user, self.customerPaymentProfileId)
-        return GetCustomerPaymentProfileRequest.process_error(self, res)
+            return True
+
+        message_text = res.find("text").contents[0]
+        raise AuthorizeNetException(message_text)
 
 
-class DeleteCustomerShippingAddressRequest(GetCustomerShippingAddressRequest):
-    """
-    Delete a customer shipping address
-    """
-    def process_response(self, res):
-        ShippingAddress.delete(self._user, self.customerAddressId)
-        return True
+class UpdateCustomerPaymentProfileRequest(AuthorizeNetRequest):
+    _keys = AuthorizeNetRequest._keys + ["customerProfileId", "paymentProfile",
+        "validationMode"]
 
-    def process_error(self, res):
-        if self.is_error_code(res, Errors.RECORD_NOT_FOUND):
-            ShippingAddress.delete(self._user, self.customerAddressId)
-        GetCustomerShippingAddressRequest.process_error(self, res)
-
-
-# TODO
-#class UpdateCustomerProfileRequest(AuthorizeNetRequest):
-#    _keys = (AuthorizeNetRequest._keys + ["profile"])
-#    
-#    def __init__(self, user):
-#        profile = Profile(user, None, None)
-#        AuthorizeNetRequest.__init__(self, profile = profile)
-
-class UpdateCustomerPaymentProfileRequest(CreateCustomerPaymentProfileRequest):
-    """
-    For updating the user's payment profile
-    """
-    def __init__(self, user, paymentid, address, creditcard, 
-                 validationMode=None):
-        CustomerRequest.__init__(self, user,
-                                 paymentProfile=PaymentProfile(address,
-                                                               creditcard,
-                                                               paymentid),
-                                 validationMode=validationMode)
+    def __init__(self, customerProfileId, paymentProfile, validationMode=None):
+        AuthorizeNetRequest.__init__(
+            self, customerProfileId=customerProfileId,
+            paymentProfile=paymentProfile, validationMode=validationMode)
 
     def process_response(self, res):
         return self.paymentProfile.customerPaymentProfileId
 
-
-class UpdateCustomerShippingAddressRequest(
-    CreateCustomerShippingAddressRequest):
-    """
-    For updating the user's shipping address
-    """
-    def __init__(self, user, address_id, address):
-        address.customerAddressId = address_id
-        CreateCustomerShippingAddressRequest.__init__(self, user,
-                                                      address=address)
-
-    def process_response(self, res):
-        return True
+    def process_error(self, res):
+        message_text = res.find("text").contents[0]
+        raise AuthorizeNetException(message_text)
 
 
 class CreateCustomerProfileTransactionRequest(AuthorizeNetRequest):
@@ -614,10 +480,7 @@ class CreateCustomerProfileTransactionRequest(AuthorizeNetRequest):
                           trans_id=int)
 
     def __init__(self, **kw):
-        from pylons import g
         self._extra = kw.get("extraOptions", {})
-        #if g.debug:
-        #    self._extra['x_test_request'] = "TRUE"
         AuthorizeNetRequest.__init__(self, **kw)
 
     @property
@@ -629,12 +492,7 @@ class CreateCustomerProfileTransactionRequest(AuthorizeNetRequest):
         return (True, self.package_response(res))
 
     def process_error(self, res):
-        if self.is_error_code(res, Errors.TRANSACTION_FAIL):
-            return (False, self.package_response(res))
-        elif self.is_error_code(res, Errors.TESTMODE):
-            return (None, None)
-        return AuthorizeNetRequest.process_error(self, res)
-
+        return (False, self.package_response(res))
 
     def package_response(self, res):
         content = res.directresponse.contents[0]
@@ -661,3 +519,168 @@ class GetSettledBatchListRequest(AuthorizeNetRequest):
     def process_response(self, res):
         return res
 
+    def process_error(self, res):
+        message_text = res.find("text").contents[0]
+        raise AuthorizeNetException(message_text)
+
+
+def create_customer_profile(merchant_customer_id, description):
+    profile = Profile(
+        description=description,
+        merchantCustomerId=merchant_customer_id,
+        paymentProfiles=None,
+        customerProfileId=None,
+    )
+
+    request = CreateCustomerProfileRequest(profile=profile)
+
+    try:
+        customer_id = request.make_request()
+    except AuthorizeNetException:
+        return None
+
+    return customer_id
+
+
+def get_customer_profile(customer_id):
+    request = GetCustomerProfileRequest(customerProfileId=customer_id)
+
+    try:
+        profile = request.make_request()
+    except AuthorizeNetException:
+        return None
+
+    return profile
+
+
+def create_payment_profile(customer_id, address, credit_card, validate=False):
+    payment_profile = PaymentProfile(billTo=address, card=credit_card)
+
+    request = CreateCustomerPaymentProfileRequest(
+        customerProfileId=customer_id,
+        paymentProfile=payment_profile,
+        validationMode="liveMode" if validate else None,
+    )
+
+    payment_profile_id = request.make_request()
+
+    return payment_profile_id
+
+
+def update_payment_profile(customer_id, payment_profile_id, address,
+                           credit_card, validate=False):
+    payment_profile = PaymentProfile(
+        billTo=address,
+        card=credit_card,
+        customerPaymentProfileId=payment_profile_id,
+    )
+
+    request = UpdateCustomerPaymentProfileRequest(
+        customerProfileId=customer_id,
+        paymentProfile=payment_profile,
+        validationMode="liveMode" if validate else None,
+    )
+
+    payment_profile_id = request.make_request()
+
+    return payment_profile_id
+
+
+# TODO: implement
+def delete_payment_profile(customer_id, payment_profile_id):
+    request = DeleteCustomerPaymentProfileRequest(
+        customerProfileId=customer_id,
+        customerPaymentProfileId=payment_profile_id,
+    )
+
+    try:
+        success = request.make_request()
+    except AuthorizeNetException:
+        return False
+    else:
+        return True
+
+
+def create_authorization_hold(customer_id, payment_profile_id, amount, invoice,
+                              customer_ip=None):
+    order = Order(invoiceNumber=invoice)
+    transaction = ProfileTransAuthOnly(
+        amount="%.2f" % amount,
+        customerProfileId=customer_id,
+        customerPaymentProfileId=payment_profile_id,
+        transId=None,
+        order=order,
+    )
+    if customer_ip:
+        extra = {"x_customer_ip": customer_ip}
+    else:
+        extra = {}
+
+    request = CreateCustomerProfileTransactionRequest(
+        transaction=transaction, extraOptions=extra)
+    success, res = request.make_request()
+
+    if (res.trans_id and
+            res.response_code == TRANSACTION_ERROR and
+            res.response_reason_code == TRANSACTION_DUPLICATE):
+        raise DuplicateTransactionError(res.trans_id)
+
+    if success:
+        return res.trans_id
+    else:
+        raise TransactionError(res.response_reason_text)
+
+
+def capture_authorization_hold(customer_id, payment_profile_id, amount,
+                               transaction_id):
+    transaction = ProfileTransPriorAuthCapture(
+        amount="%.2f" % amount,
+        customerProfileId=customer_id,
+        customerPaymentProfileId=payment_profile_id,
+        transId=transaction_id,
+    )
+
+    request = CreateCustomerProfileTransactionRequest(
+        transaction=transaction)
+    success, res = request.make_request()
+    response_reason_code = res.get("response_reason_code")
+
+    if success:
+        return
+    elif response_reason_code == TRANSACTION_NOT_FOUND:
+        raise AuthorizationHoldNotFound()
+    else:
+        raise TransactionError(res.response_reason_text)
+
+
+def void_authorization_hold(customer_id, payment_profile_id, transaction_id):
+    transaction = ProfileTransVoid(
+        amount=None,
+        customerProfileId=customer_id,
+        customerPaymentProfileId=payment_profile_id,
+        transId=transaction_id,
+    )
+
+    request = CreateCustomerProfileTransactionRequest(
+        transaction=transaction)
+    success, res = request.make_request()
+
+    if success:
+        return res.trans_id
+    else:
+        raise TransactionError(res.response_reason_text)
+
+
+def refund_transaction(customer_id, payment_profile_id, amount, transaction_id):
+    transaction = ProfileTransRefund(
+        amount="%.2f" % amount,
+        customerProfileId=customer_id,
+        customerPaymentProfileId=payment_profile_id,
+        transId=transaction_id,
+    )
+    request = CreateCustomerProfileTransactionRequest(
+        transaction=transaction)
+    success, res = request.make_request()
+
+    if not success:
+        raise TransactionError(res.response_reason_text)

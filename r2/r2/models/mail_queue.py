@@ -16,13 +16,16 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 import datetime
 import hashlib
+import time
+import email.utils
 from email.MIMEText import MIMEText
+from email.errors import HeaderParseError
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql.base import PGInet
@@ -30,7 +33,8 @@ from sqlalchemy.dialects.postgresql.base import PGInet
 from r2.lib.db.tdb_sql import make_metadata, index_str, create_table
 from r2.lib.utils import Enum, tup
 from r2.lib.memoize import memoize
-from pylons import g, request
+from pylons import request
+from pylons import app_globals as g
 from pylons.i18n import _
 
 def mail_queue(metadata):
@@ -170,6 +174,7 @@ class EmailHandler(object):
             try:
                 o.insert().values({o.c.email: email,
                                    o.c.msg_hash: msg_hash}).execute()
+                g.stats.simple_event('share.opt_out')
 
                 #clear caches
                 has_opted_out(email, _update = True)
@@ -186,6 +191,7 @@ class EmailHandler(object):
             o = self.opt_table
             if self.has_opted_out(email):
                 sa.delete(o, o.c.email == email).execute()
+                g.stats.simple_event('share.opt_in')
 
                 #clear caches
                 has_opted_out(email, _update = True)
@@ -232,7 +238,7 @@ class EmailHandler(object):
 
 
     def from_queue(self, max_date, batch_limit = 50, kind = None):
-        from r2.models import is_banned_IP, Account, Thing
+        from r2.models import Account, Thing
         keep_trying = True
         min_id = None
         s = self.queue_table
@@ -263,10 +269,6 @@ class EmailHandler(object):
             things = Thing._by_fullname(tids, data = True,
                                         return_dict = True) if tids else {}
 
-            # make sure no IPs have been banned in the mean time
-            ips = set(x[6] for x in res)
-            ips = dict((ip, is_banned_IP(ip)) for ip in ips)
-
             # get the lower bound date for next iteration
             min_id = max(x[8] for x in res)
 
@@ -276,7 +278,7 @@ class EmailHandler(object):
             for (addr, acct, fname, fulln, body, kind, ip, date, uid,
                  msg_hash, fr_addr, reply_to) in res:
                 yield (accts.get(acct), things.get(fulln), addr,
-                       fname, date, ip, ips[ip], kind, msg_hash, body,
+                       fname, date, ip, kind, msg_hash, body,
                        fr_addr, reply_to)
 
     def clear_queue(self, max_date, kind = None):
@@ -290,6 +292,9 @@ class EmailHandler(object):
 class Email(object):
     handler = EmailHandler()
 
+    # Do not modify in any way other than appending new items!
+    # Database tables storing mail stuff use an int column as an index into 
+    # this Enum, so anything other than appending new items breaks mail history.
     Kind = Enum("SHARE", "FEEDBACK", "ADVERTISE", "OPTOUT", "OPTIN",
                 "VERIFY_EMAIL", "RESET_PASSWORD",
                 "BID_PROMO",
@@ -303,30 +308,49 @@ class Email(object):
                 "GOLDMAIL",
                 "PASSWORD_CHANGE",
                 "EMAIL_CHANGE",
+                "REFUNDED_PROMO",
+                "VOID_PAYMENT",
+                "GOLD_GIFT_CODE",
+                "SUSPICIOUS_PAYMENT",
+                "FRAUD_ALERT",
+                "USER_FRAUD",
+                "MESSAGE_NOTIFICATION",
+                "ADS_ALERT",
+                "EDITED_LIVE_PROMO",
                 )
 
+    # Do not remove anything from this dictionary!  See above comment.
     subjects = {
         Kind.SHARE : _("[reddit] %(user)s has shared a link with you"),
         Kind.FEEDBACK : _("[feedback] feedback from '%(user)s'"),
-        Kind.ADVERTISE :  _("[ad_inq] feedback from '%(user)s'"),
+        Kind.ADVERTISE :  _("[advertising] feedback from '%(user)s'"),
         Kind.OPTOUT : _("[reddit] email removal notice"),
         Kind.OPTIN  : _("[reddit] email addition notice"),
         Kind.RESET_PASSWORD : _("[reddit] reset your password"),
         Kind.VERIFY_EMAIL : _("[reddit] verify your email address"),
-        Kind.BID_PROMO : _("[reddit] your bid has been accepted"),
+        Kind.BID_PROMO : _("[reddit] your budget has been accepted"),
         Kind.ACCEPT_PROMO : _("[reddit] your promotion has been accepted"),
         Kind.REJECT_PROMO : _("[reddit] your promotion has been rejected"),
         Kind.QUEUED_PROMO : _("[reddit] your promotion has been charged"),
         Kind.LIVE_PROMO   : _("[reddit] your promotion is now live"),
         Kind.FINISHED_PROMO : _("[reddit] your promotion has finished"),
         Kind.NEW_PROMO : _("[reddit] your promotion has been created"),
+        Kind.EDITED_LIVE_PROMO : _("[reddit] your promotion edit is being approved"),
         Kind.NERDMAIL : _("[reddit] hey, nerd!"),
         Kind.GOLDMAIL : _("[reddit] reddit gold activation link"),
         Kind.PASSWORD_CHANGE : _("[reddit] your password has been changed"),
         Kind.EMAIL_CHANGE : _("[reddit] your email address has been changed"),
+        Kind.REFUNDED_PROMO: _("[reddit] your campaign didn't get enough impressions"),
+        Kind.VOID_PAYMENT: _("[reddit] your payment has been voided"),
+        Kind.GOLD_GIFT_CODE: _("[reddit] your reddit gold gift code"),
+        Kind.SUSPICIOUS_PAYMENT: _("[selfserve] suspicious payment alert"),
+        Kind.FRAUD_ALERT: _("[selfserve] fraud alert"),
+        Kind.USER_FRAUD: _("[selfserve] a user has committed fraud"),
+        Kind.MESSAGE_NOTIFICATION: _("[reddit] message notification"),
+        Kind.ADS_ALERT: _("[reddit] Ads Alert"),
         }
 
-    def __init__(self, user, thing, email, from_name, date, ip, banned_ip,
+    def __init__(self, user, thing, email, from_name, date, ip,
                  kind, msg_hash, body = '', from_addr = '',
                  reply_to = ''):
         self.user = user
@@ -336,7 +360,6 @@ class Email(object):
         self._from_name = from_name
         self.date = date
         self.ip = ip
-        self.banned_ip = banned_ip
         self.kind = kind
         self.sent = False
         self.body = body
@@ -368,7 +391,6 @@ class Email(object):
     def should_queue(self):
         return (not self.user  or not self.user._spam) and \
                (not self.thing or not self.thing._spam) and \
-               not self.banned_ip and \
                (self.kind == self.Kind.OPTOUT or
                 not has_opted_out(self.to_addr))
 
@@ -395,15 +417,28 @@ class Email(object):
             self.sent = True
 
     def to_MIMEText(self):
-        def utf8(s):
+        def utf8(s, reject_newlines=True):
+            if reject_newlines and '\n' in s:
+                raise HeaderParseError(
+                    'header value contains unexpected newline: {!r}'.format(s))
             return s.encode('utf8') if isinstance(s, unicode) else s
-        fr = '"%s" <%s>' % (self.from_name(), self.fr_addr)
-        if not fr.startswith('-') and not self.to_addr.startswith('-'): # security
-            msg = MIMEText(utf8(self.body))
+
+        fr = '"%s" <%s>' % (
+            self.from_name().replace('"', ''),
+            self.fr_addr.replace('>', ''),
+        )
+
+        # Addresses that start with a dash could confuse poorly-written
+        # software's argument parsers, and thus are disallowed by default in
+        # Postfix: http://www.postfix.org/postconf.5.html#allow_min_user
+        if not fr.startswith('-') and not self.to_addr.startswith('-'):
+            msg = MIMEText(utf8(self.body, reject_newlines=False))
             msg.set_charset('utf8')
             msg['To']      = utf8(self.to_addr)
             msg['From']    = utf8(fr)
             msg['Subject'] = utf8(self.subject)
+            timestamp = time.mktime(self.date.timetuple())
+            msg['Date'] = utf8(email.utils.formatdate(timestamp))
             if self.user:
                 msg['X-Reddit-username'] = utf8(self.user.name)
             msg['X-Reddit-ID'] = self.msg_hash

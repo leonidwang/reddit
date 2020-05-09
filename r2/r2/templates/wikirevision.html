@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -31,9 +31,12 @@
     %if thing._hidden:
        hidden
     %endif
+    %if thing.admin_deleted:
+        deleted
+    %endif
     ">
     
-        %if thing.show_extended:
+        %if thing.show_compare:
             <td style="white-space: nowrap;">
                 <input type="radio" name="v1" value="${thing._id}" checked="yes">
                 <input type="radio" name="v2" value="${thing._id}" checked="yes">
@@ -41,7 +44,7 @@
         %endif
     
     <td style="white-space: nowrap;">
-        ${timestamp(thing.date)}&nbsp;ago
+        ${timestamp(thing.date, live=True, include_tense=True)}
     </td>
     
     %if not thing.show_extended:
@@ -62,18 +65,32 @@
         ${thing._get('reason')}
     </td>
    
-    %if thing.show_extended and c.is_wiki_mod:
+    %if thing.show_extended:
         <td>
-            <a href="#" class="revision_hide" data-revision="${thing._id}">hide</a>
+            <a href="#" class="revision_hide access-required"
+               data-revision="${thing._id}"
+               data-type="wikipage"
+               data-event-action="wikirevise"
+               data-event-detail="hide"
+               >hide</a>
         </td>
         <td class="wiki_revert" style="white-space: nowrap;">
             ${ynbutton(_("revert here"), 
                        _("done"),
                        quote("..%s/revert" % c.wiki_api_url), 
                        hidden_data=dict(revision=thing._id, page=thing.page), 
-                       post_callback="$.refresh"
+                       post_callback="$.refresh",
+                       event_target='wikipage',
+                       event_action='wikirevise',
+                       event_detail='revert'
                       )
              }
+        </td>
+    %endif
+
+    %if c.user_is_admin:
+        <td>
+            <a href="#" class="revision_delete" data-revision="${thing._id}">delete</a>
         </td>
     %endif
 </tr>

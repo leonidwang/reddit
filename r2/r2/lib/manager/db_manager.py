@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -35,7 +35,7 @@ APPLICATION_NAME = "reddit@%s:%d" % (socket.gethostname(), os.getpid())
 
 
 def get_engine(name, db_host='', db_user='', db_pass='', db_port='5432',
-               pool_size=5, max_overflow=5):
+               pool_size=5, max_overflow=5, g_override=None):
     db_port = int(db_port)
 
     arguments = {
@@ -50,7 +50,7 @@ def get_engine(name, db_host='', db_user='', db_pass='', db_port='5432',
         arguments["password"] = db_pass
     dsn = "%20".join("%s=%s" % x for x in arguments.iteritems())
 
-    return sqlalchemy.create_engine(
+    engine = sqlalchemy.create_engine(
         'postgresql:///?dsn=' + dsn,
         strategy='threadlocal',
         pool_size=int(pool_size),
@@ -59,6 +59,14 @@ def get_engine(name, db_host='', db_user='', db_pass='', db_port='5432',
         # in place of strings yet
         use_native_unicode=False,
     )
+
+    if g_override:
+        sqlalchemy.event.listens_for(engine, 'before_cursor_execute')(
+            g_override.stats.pg_before_cursor_execute)
+        sqlalchemy.event.listens_for(engine, 'after_cursor_execute')(
+            g_override.stats.pg_after_cursor_execute)
+
+    return engine
 
 
 class db_manager:
@@ -83,9 +91,14 @@ class db_manager:
         self.avoid_master_reads[name] = avoid_master
 
     def setup_db(self, db_name, g_override=None, **params):
-        engine = get_engine(**params)
+        engine = get_engine(g_override=g_override, **params)
         self._engines[db_name] = engine
-        self.test_engine(engine, g_override)
+
+        if db_name not in ("email", "authorize", "hc", "traffic"):
+            # test_engine creates a connection to the database, for some less
+            # important and less used databases we will skip this and only
+            # create the connection if it's needed
+            self.test_engine(engine, g_override)
 
     def things_iter(self):
         for name, engines in self._things.iteritems():

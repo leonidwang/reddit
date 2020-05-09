@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -25,7 +25,7 @@
 <%def name="dropdown()">
   ## caching comment:
   ##  see caching comment for plain_link.  In addition to the args, 
-  ##  this function depends on c.site.name, c.render_style and c.cname.
+  ##  this function depends on c.site.name and c.render_style
   <% css_class = str(thing.css_class) if thing.css_class else "" %>
   %if thing:
     %if thing.title and thing.selected:
@@ -34,8 +34,7 @@
 
     <div class="dropdown ${css_class}"
          ${"id='%s'" % thing._id if thing._id else ""}
-         onclick="open_menu(this)"
-         onmouseover="hover_open_menu(this)">
+         onclick="open_menu(this)">
  
       %if thing.selected:
           <span class="selected">${thing.selected.selected_title()}</span>
@@ -46,12 +45,8 @@
 
     <div class="drop-choices ${css_class}">
       %for option in thing:
-        <% _class = "choice " + option.css_class + (" selected" if option == thing.selected else "") %>
-        %if thing.use_post:
-          ${post_link(option.title, option.base_path, option.path,
-                      option.action_params, _sr_path=option.sr_path, _class=_class)}
-        %else:
-          ${plain_link(option.title, option.path, _sr_path = option.sr_path, _class=_class)}
+        %if option != thing.selected:
+          ${option}
         %endif
       %endfor
     </div>
@@ -90,29 +85,6 @@
   %endif
 </%def>
 
-
-<%def name="multicolumn()">
-  <% 
-     buttons = thing.options
-     l = len(buttons)/2
-     l = max(l, len(buttons) - l)
-     buttons = (buttons[:l], buttons[l:])
-   %>
-  %for b in buttons:
-    <ul class="hover">
-      %for i, option in enumerate(b):
-        <%
-           cls = "first" if i == 0 else ""
-         %>
-        %if option == thing.selected:
-          <li class="selected ${cls}">${option.selected_title()}</li>
-        %else:
-          <li class="${cls}">${option}</li>
-        %endif
-      %endfor
-    </ul>
-  %endfor
-</%def>
 
 <%def name="tabmenu()">
   %if thing:

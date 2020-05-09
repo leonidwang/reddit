@@ -16,11 +16,11 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
-<%namespace file="utils.html" import="optionalstyle"/>
+<%namespace file="utils.html" import="optionalstyle, nsfw_stamp, quarantine_stamp"/>
 
 <%!
    from pylons.i18n import _, ungettext
@@ -47,9 +47,9 @@
 <% 
    from r2.lib.strings import Score
    domain = get_domain(subreddit=False)
-   permalink = "http://%s%s" % (domain, thing.permalink)
-   expanded = request.get.get("expanded")
-   two_col = request.get.has_key("twocolumn") if l else False
+   permalink = "%s://%s%s" % (g.default_scheme, domain, thing.permalink)
+   expanded = request.GET.get("expanded")
+   two_col = request.GET.has_key("twocolumn") if l else False
  %>
   ${self.arrows(thing)}
   <div class="reddit-entry entry ${thing.like_cls}" 
@@ -62,7 +62,7 @@
     %if c.site.link_flair_position == 'left' and thing.flair_text:
       ${flair()}
     %endif
-    <a class="reddit-link-title"
+    <a class="reddit-link-title may-blank"
       ${optionalstyle("text-decoration:none;color:#336699;font-size:small;")}
        %if thing.is_self:
          href="${permalink}"
@@ -74,13 +74,6 @@
        %endif
        %if c.link_target:
          target="${c.link_target}"
-       %elif c.user.pref_newwindow:
-         target="_blank"
-       %elif c.cname:
-         target="_top"
-       %endif
-       %if thing.mousedown_url:
-         onmousedown="save_href($(this));this.href='${thing.mousedown_url}'"
        %endif
        >
       ${thing.title}
@@ -98,9 +91,18 @@
          ${optionalstyle("color:gray;")}
        %endif
        >
+      %if thing.quarantine:
+        <span class="quarantine-stamp stamp">${quarantine_stamp()}</span>
+      %endif
+      %if thing.nsfw:
+        <span class="nsfw-stamp stamp">${nsfw_stamp()}</span>
+      %endif
       %if not expanded:
       <%
-       score_dislikes, score_unvoted, score_likes = thing.display_score
+       if thing.hide_score:
+           score_dislikes = score_unvoted = score_likes = unsafe('&bull; points')
+       else:
+           score_dislikes, score_unvoted, score_likes = thing.display_score
        %>
       <span class="score dislikes" ${hide_if_appropriate('dislikes')}>
          ${score_dislikes}
@@ -113,7 +115,7 @@
       </span>
       &#32;|&#32;
       %endif
-      <a class="reddit-comment-link"
+      <a class="reddit-comment-link may-blank"
          ${optionalstyle("color:gray")}
          %if c.link_target:
            target="${c.link_target}"
@@ -121,7 +123,5 @@
          href="${permalink}">${thing.comment_label}</a>
     </small>
   </div>
-  <div class="reddit-link-end" ${optionalstyle("clear:left; padding:3px;")}>
-    <!--IE6sux-->
-  </div>
+  <div class="reddit-link-end" ${optionalstyle("clear:left; padding:3px;")}></div>
 </%def>

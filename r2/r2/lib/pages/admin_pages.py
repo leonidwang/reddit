@@ -16,13 +16,17 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from pylons         import c, g
+from pylons import config
+from pylons import tmpl_context as c
+from pylons import app_globals as g
+from pylons.i18n import N_
+
 from r2.lib.wrapped import Templated
-from pages   import Reddit
+from r2.lib.pages import LinkInfoBar, Reddit
 from r2.lib.menus import (
     NamedButton,
     NavButton,
@@ -30,6 +34,7 @@ from r2.lib.menus import (
     NavMenu,
     OffsiteButton,
 )
+from r2.lib.utils import timesince
 
 def admin_menu(**kwargs):
     buttons = [
@@ -43,6 +48,12 @@ def admin_menu(**kwargs):
     return admin_menu
 
 class AdminSidebar(Templated):
+    def __init__(self, user):
+        Templated.__init__(self)
+        self.user = user
+
+
+class SponsorSidebar(Templated):
     def __init__(self, user):
         Templated.__init__(self)
         self.user = user
@@ -74,7 +85,41 @@ class AdminLinkMenu(NavMenu):
         NavMenu.__init__(self, [], title='admin', type="tabdrop")
 
 
-try:
-    from r2admin.lib.pages import *
-except ImportError:
+class AdminNotesSidebar(Templated):
+    EMPTY_MESSAGE = {
+        "domain": N_("No notes for this domain"),
+        "ip": N_("No notes for this IP address"),
+        "subreddit": N_("No notes for this subreddit"),
+        "user": N_("No notes for this user"),
+    }
+
+    SYSTEMS = {
+        "domain": N_("domain"),
+        "ip": N_("IP address"),
+        "subreddit": N_("subreddit"),
+        "user": N_("user"),
+    }
+
+    def __init__(self, system, subject):
+        from r2.models.admin_notes import AdminNotesBySystem
+
+        self.system = system
+        self.subject = subject
+        self.author = c.user.name
+        self.notes = AdminNotesBySystem.in_display_order(system, subject)
+        # Convert timestamps for easier reading/translation
+        for note in self.notes:
+            note["timesince"] = timesince(note["when"])
+        Templated.__init__(self)
+
+
+class AdminLinkInfoBar(LinkInfoBar):
     pass
+
+
+class AdminDetailsBar(Templated):
+    pass
+
+
+if config['r2.import_private']:
+    from r2admin.lib.pages import *

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -61,45 +61,6 @@ def subscribe_to_blog_and_annoucements(filename):
                 print ("%d: didn't subscribe %s to %s" % (i, account.name, sr.name))
 
 
-def upgrade_messages(update_comments = True, update_messages = True,
-                     update_trees = True):
-    from r2.lib.db import queries
-    from r2.lib import comment_tree, cache
-    from r2.models import Account
-    from pylons import g
-    accounts = set()
-
-    def batch_fn(items):
-        g.reset_caches()
-        return items
-    
-    if update_messages or update_trees:
-        q = Message._query(Message.c.new == True,
-                           sort = desc("_date"),
-                           data = True)
-        for m in fetch_things2(q, batch_fn = batch_fn):
-            print m,m._date
-            if update_messages:
-                accounts = accounts | queries.set_unread(m, m.new)
-            else:
-                accounts.add(m.to_id)
-    if update_comments:
-        q = Comment._query(Comment.c.new == True,
-                           sort = desc("_date"))
-        q._filter(Comment.c._id < 26152162676)
-
-        for m in fetch_things2(q, batch_fn = batch_fn):
-            print m,m._date
-            queries.set_unread(m, True)
-
-    print "Precomputing comment trees for %d accounts" % len(accounts)
-
-    for i, a in enumerate(accounts):
-        if not isinstance(a, Account):
-            a = Account._byID(a)
-        print i, a
-        comment_tree.user_messages(a)
-
 def recompute_unread(min_date = None):
     from r2.models import Inbox, Account, Comment, Message
     from r2.lib.db import queries
@@ -137,7 +98,7 @@ def pushup_permacache(verbosity=1000):
     """When putting cassandra into the permacache chain, we need to
        push everything up into the rest of the chain, so this is
        everything that uses the permacache, as of that check-in."""
-    from pylons import g
+    from pylons import app_globals as g
     from r2.models import Link, Subreddit, Account
     from r2.lib.db.operators import desc
     from r2.lib.comment_tree import comments_key, messages_key
@@ -224,60 +185,8 @@ def pushup_permacache(verbosity=1000):
         populate(keys)
 
 
-def port_cassavotes():
-    from r2.models import Vote, Account, Link, Comment
-    from r2.models.vote import CassandraVote, CassandraLinkVote, CassandraCommentVote
-    from r2.lib.db.tdb_cassandra import CL
-    from r2.lib.utils import fetch_things2, to36, progress
-
-    ts = [(Vote.rel(Account, Link), CassandraLinkVote),
-          (Vote.rel(Account, Comment), CassandraCommentVote)]
-
-    dataattrs = set(['valid_user', 'valid_thing', 'ip', 'organic'])
-
-    for prel, crel in ts:
-        vq = prel._query(sort=desc('_date'),
-                         data=True,
-                         eager_load=False)
-        vq = fetch_things2(vq)
-        vq = progress(vq, persec=True)
-        for v in vq:
-            t1 = to36(v._thing1_id)
-            t2 = to36(v._thing2_id)
-            cv = crel(thing1_id = t1,
-                      thing2_id = t2,
-                      date=v._date,
-                      name=v._name)
-            for dkey, dval in v._t.iteritems():
-                if dkey in dataattrs:
-                    setattr(cv, dkey, dval)
-
-            cv._commit(write_consistency_level=CL.ONE)
-
-def port_cassasaves(after_id=None, estimate=12489897):
-    from r2.models import SaveHide, CassandraSave
-    from r2.lib.db.operators import desc
-    from r2.lib.db.tdb_cassandra import CL
-    from r2.lib.utils import fetch_things2, to36, progress
-
-    q = SaveHide._query(
-        SaveHide.c._name == 'save',
-        sort=desc('_date'),
-        data=False,
-        eager_load=False)
-
-    if after_id is not None:
-        q._after(SaveHide._byID(after_id))
-
-    for sh in progress(fetch_things2(q), estimate=estimate):
-
-        csh = CassandraSave(thing1_id = to36(sh._thing1_id),
-                            thing2_id = to36(sh._thing2_id),
-                            date = sh._date)
-        csh._commit(write_consistency_level = CL.ONE)
-
 def port_cassaurls(after_id=None, estimate=15231317):
-    from r2.models import Link, LinksByUrl
+    from r2.models import Link, LinksByUrlAndSubreddit
     from r2.lib.db import tdb_cassandra
     from r2.lib.db.operators import desc
     from r2.lib.db.tdb_cassandra import CL
@@ -295,11 +204,8 @@ def port_cassaurls(after_id=None, estimate=15231317):
     chunks = in_chunks(q, 500)
 
     for chunk in chunks:
-        with LinksByUrl._cf.batch(write_consistency_level = CL.ONE) as b:
-            for l in chunk:
-                k = LinksByUrl._key_from_url(l.url)
-                if k:
-                    b.insert(k, {l._id36: l._id36})
+        for l in chunk:
+            LinksByUrlAndSubreddit.add_link(l)
 
 def port_deleted_links(after_id=None):
     from r2.models import Link
@@ -319,22 +225,6 @@ def port_deleted_links(after_id=None):
             for link in chunk:
                 query = get_deleted_links(link.author_id)
                 m.insert(query, [link])
-
-def port_cassahides():
-    from r2.models import SaveHide, CassandraHide
-    from r2.lib.db.tdb_cassandra import CL
-    from r2.lib.db.operators import desc
-    from r2.lib.utils import fetch_things2, timeago, progress
-
-    q = SaveHide._query(SaveHide.c._date > timeago('1 week'),
-                        SaveHide.c._name == 'hide',
-                        sort=desc('_date'))
-    q = fetch_things2(q)
-    q = progress(q, estimate=1953374)
-
-    for sh in q:
-        CassandraHide._hide(sh._thing1, sh._thing2,
-                            write_consistency_level=CL.ONE)
 
 def convert_query_cache_to_json():
     import cPickle

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -27,10 +27,12 @@ import random
 import socket
 import time
 import threading
+import random
 
 from pycassa import columnfamily
 from pycassa import pool
 
+from r2.lib import baseplate_integration
 from r2.lib import cache
 from r2.lib import utils
 
@@ -70,7 +72,6 @@ class TimingStatBuffer:
                 break
 
             total_time, count = v.real, v.imag
-            yield k, str(int(count)) + '|c'
             divisor = count or 1
             mean = total_time / divisor
             yield k, str(mean * 1000) + '|ms'
@@ -239,6 +240,13 @@ class Timer:
         self._stop = None
         self._timings = []
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, type, value, tb):
+        self.stop()
+
     def flush(self):
         for timing in self._timings:
             self.send(*timing)
@@ -290,6 +298,10 @@ class Stats:
     def get_timer(self, name, publish=True):
         return Timer(self.client, name, publish)
 
+    # Just a convenience method to use timers as context managers clearly
+    def quick_time(self, *args, **kwargs):
+        return self.get_timer(*args, **kwargs)
+
     def transact(self, action, start, end):
         timer = self.get_timer('service_time')
         timer.send(action, start, end)
@@ -317,20 +329,18 @@ class Stats:
         if counter:
             counter.increment(parts[-1], delta=delta)
 
-    def event_count(self, event_name, name):
+    def simple_timing(self, event_name, ms):
+        self.client.timing_stats.record(event_name, start=0, end=ms)
+
+    def event_count(self, event_name, name, sample_rate=None):
+        if sample_rate is None:
+            sample_rate = 1.0
         counter = self.get_counter('event.%s' % event_name)
-        if counter:
+        if counter and random.random() < sample_rate:
             counter.increment(name)
             counter.increment('total')
 
-    def cache_count(self, name, delta=1, sample_rate=None):
-        if sample_rate is None:
-            sample_rate = self.CACHE_SAMPLE_RATE
-        counter = self.get_counter('cache')
-        if counter and random.random() < sample_rate:
-            counter.increment(name, delta=delta)
-
-    def cache_count_multi(self, data, cache_name=None, sample_rate=None):
+    def cache_count_multi(self, data, sample_rate=None):
         if sample_rate is None:
             sample_rate = self.CACHE_SAMPLE_RATE
         counter = self.get_counter('cache')
@@ -345,16 +355,17 @@ class Stats:
                 # Work the same for amqp.consume_items and amqp.handle_items.
                 msg_tup = utils.tup(msgs)
 
+                metrics_name = "amqp." + queue_name
                 start = time.time()
                 try:
-                    return processor(msgs, *args)
+                    with baseplate_integration.make_server_span(metrics_name):
+                        return processor(msgs, *args)
                 finally:
                     service_time = (time.time() - start) / len(msg_tup)
                     for n, msg in enumerate(msg_tup):
                         fake_start = start + n * service_time
                         fake_end = fake_start + service_time
-                        self.transact('amqp.%s' % queue_name,
-                                      fake_start, fake_end)
+                        self.transact(metrics_name, fake_start, fake_end)
                     self.flush()
             return wrap_processor
         return decorator
@@ -368,26 +379,51 @@ class Stats:
     def end_logging_timings(self):
         return self.client.timing_stats.end_logging()
 
-    def cassandra_event(self, operation, column_families, success,
-                        start, end):
+    def cf_key_iter(self, operation, column_families, suffix):
         if not self.client:
             return
         if not isinstance(column_families, list):
             column_families = [column_families]
         for cf in column_families:
-            key = '.'.join([
-                'cassandra', cf, operation,
-                self.CASSANDRA_KEY_SUFFIXES[success]])
+            yield '.'.join(['cassandra', cf, operation, suffix])
+
+    def cassandra_timing(self, operation, column_families, success,
+                         start, end):
+        suffix = self.CASSANDRA_KEY_SUFFIXES[success]
+        for key in self.cf_key_iter(operation, column_families, suffix):
             self.client.timing_stats.record(key, start, end)
+
+    def cassandra_counter(self, operation, column_families, suffix, delta):
+        for key in self.cf_key_iter(operation, column_families, suffix):
+            self.client.counting_stats.record(key, delta)
 
     def pg_before_cursor_execute(self, conn, cursor, statement, parameters,
                                context, executemany):
+        from pylons import tmpl_context as c
+
         context._query_start_time = time.time()
+
+        try:
+            c.trace
+        except TypeError:
+            # the tmpl_context global isn't available out of request
+            return
+
+        if c.trace:
+            context.pg_child_trace = c.trace.make_child("postgres")
+            context.pg_child_trace.start()
 
     def pg_after_cursor_execute(self, conn, cursor, statement, parameters,
                               context, executemany):
         dsn = dict(part.split('=', 1)
                    for part in context.engine.url.query['dsn'].split())
+
+        if getattr(context, "pg_child_trace", None):
+            context.pg_child_trace.set_tag("host", dsn["host"])
+            context.pg_child_trace.set_tag("db", dsn["dbname"])
+            context.pg_child_trace.set_tag("statement", statement)
+            context.pg_child_trace.finish()
+
         start = context._query_start_time
         self.pg_event(dsn['host'], dsn['dbname'], start, time.time())
 
@@ -399,7 +435,7 @@ class Stats:
 
     def count_string(self, key, value, count=1):
         self.client.string_counts.record(key, str(value), count=count)
-   
+
 
 class CacheStats:
     def __init__(self, parent, cache_name):
@@ -408,31 +444,72 @@ class CacheStats:
         self.hit_stat_name = '%s.hit' % self.cache_name
         self.miss_stat_name = '%s.miss' % self.cache_name
         self.total_stat_name = '%s.total' % self.cache_name
+        self.hit_stat_template = '%s.%%s.hit' % self.cache_name
+        self.miss_stat_template = '%s.%%s.miss' % self.cache_name
+        self.total_stat_template = '%s.%%s.total' % self.cache_name
 
-    def cache_hit(self, delta=1):
+    def cache_hit(self, delta=1, subname=None):
         if delta:
-            self.parent.cache_count(self.hit_stat_name, delta=delta)
-            self.parent.cache_count(self.total_stat_name, delta=delta)
-
-    def cache_miss(self, delta=1):
-        if delta:
-            self.parent.cache_count(self.miss_stat_name, delta=delta)
-            self.parent.cache_count(self.total_stat_name, delta=delta)
-
-    def cache_report(self, hits=0, misses=0, cache_name=None, sample_rate=None):
-        if hits or misses:
-            if not cache_name:
-                cache_name = self.cache_name
-            hit_stat_name = '%s.hit' % cache_name
-            miss_stat_name = '%s.miss' % cache_name
-            total_stat_name = '%s.total' % cache_name
             data = {
-                hit_stat_name: hits,
-                miss_stat_name: misses,
-                total_stat_name: hits + misses,
+                self.hit_stat_name: delta,
+                self.total_stat_name: delta,
             }
-            self.parent.cache_count_multi(data, cache_name=cache_name,
-                                          sample_rate=sample_rate)
+            if subname:
+                data.update({
+                    self.hit_stat_template % subname: delta,
+                    self.total_stat_template % subname: delta,
+                })
+            self.parent.cache_count_multi(data)
+
+    def cache_miss(self, delta=1, subname=None):
+        if delta:
+            data = {
+                self.miss_stat_name: delta,
+                self.total_stat_name: delta,
+            }
+            if subname:
+                data.update({
+                    self.miss_stat_template % subname: delta,
+                    self.total_stat_template % subname: delta,
+                })
+            self.parent.cache_count_multi(data)
+
+
+class StaleCacheStats(CacheStats):
+    def __init__(self, parent, cache_name):
+        CacheStats.__init__(self, parent, cache_name)
+        self.stale_hit_name = '%s.stale.hit' % self.cache_name
+        self.stale_miss_name = '%s.stale.miss' % self.cache_name
+        self.stale_total_name = '%s.stale.total' % self.cache_name
+        self.stale_hit_stat_template = '%s.stale.%%s.hit' % self.cache_name
+        self.stale_miss_stat_template = '%s.stale.%%s.miss' % self.cache_name
+        self.stale_total_stat_template = '%s.stale.%%s.total' % self.cache_name
+
+    def stale_hit(self, delta=1, subname=None):
+        if delta:
+            data = {
+                self.stale_hit_name: delta,
+                self.stale_total_name: delta,
+            }
+            if subname:
+                data.update({
+                    self.stale_hit_stat_template % subname: delta,
+                    self.stale_total_stat_template % subname: delta,
+                })
+            self.parent.cache_count_multi(data)
+
+    def stale_miss(self, delta=1, subname=None):
+        if delta:
+            data = {
+                self.stale_miss_name: delta,
+                self.stale_total_name: delta,
+            }
+            if subname:
+                data.update({
+                    self.stale_miss_stat_template % subname: delta,
+                    self.stale_total_stat_template % subname: delta,
+                })
+            self.parent.cache_count_multi(data)
 
 
 class StatsCollectingConnectionPool(pool.ConnectionPool):
@@ -480,25 +557,55 @@ class StatsCollectingConnectionPool(pool.ConnectionPool):
 
         def record_error(method_name, cf_name, start, end):
             if cf_name and self.stats:
-                self.stats.cassandra_event(method_name, cf_name, False,
+                self.stats.cassandra_timing(method_name, cf_name, False,
                                            start, end)
 
         def record_success(method_name, cf_name, start, end):
             if cf_name and self.stats:
-                self.stats.cassandra_event(method_name, cf_name, True,
+                self.stats.cassandra_timing(method_name, cf_name, True,
                                            start, end)
 
-        def instrument(f, get_cf_name):
+        def record_size(method_name, cf_name, result, key="size"):
+            if cf_name and self.stats:
+                # if we don't have easy access to the wire-size, we can
+                # proxy because thrift objects have descriptive reprs
+                size = len(repr(result))
+                self.stats.cassandra_counter(method_name, cf_name, key, size)
+
+        # size_sample determines how often we measure and track the size
+        # of the response from cassandra.
+        def instrument(f, get_cf_name, size_sample=0.01):
             def call_with_instrumentation(*args, **kwargs):
+                from pylons import tmpl_context as c
+
                 cf_name = get_cf_name(args, kwargs)
+                method_name = f.__name__
+
+                try:
+                    c.trace
+                except TypeError:
+                    # the tmpl_context global isn't available out of request
+                    cassandra_child_trace = utils.SimpleSillyStub()
+                else:
+                    if c.trace:
+                        cassandra_child_trace = c.trace.make_child("cassandra")
+                        cassandra_child_trace.set_tag("column_family", cf_name)
+                        cassandra_child_trace.set_tag("method", method_name)
+                    else:
+                        cassandra_child_trace = utils.SimpleSillyStub()
+
                 start = time.time()
                 try:
-                    result = f(*args, **kwargs)
+                    with cassandra_child_trace:
+                        result = f(*args, **kwargs)
                 except:
-                    record_error(f.__name__, cf_name, start, time.time())
+                    record_error(method_name, cf_name, start, time.time())
                     raise
                 else:
-                    record_success(f.__name__, cf_name, start, time.time())
+                    if random.random() < size_sample:
+                        record_size(method_name, cf_name, result)
+
+                    record_success(method_name, cf_name, start, time.time())
                     return result
             return call_with_instrumentation
 
@@ -507,4 +614,3 @@ class StatsCollectingConnectionPool(pool.ConnectionPool):
             f = getattr(wrapper, method_name)
             setattr(wrapper, method_name, instrument(f, get_cf_name))
         return wrapper
-

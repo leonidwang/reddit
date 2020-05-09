@@ -16,18 +16,22 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from r2.controllers.reddit_base import RedditController
 from r2.lib.base import proxyurl
+from r2.lib.csrf import csrf_exempt
 from r2.lib.template_helpers import get_domain
 from r2.lib.pages import Embed, BoringPage, HelpPage
 from r2.lib.filters import websafe, SC_OFF, SC_ON
 from r2.lib.memoize import memoize
+
 from pylons.i18n import _
-from pylons import c, g, request
+from pylons import request
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 
 from BeautifulSoup import BeautifulSoup, Tag
 
@@ -37,7 +41,7 @@ from urllib2 import HTTPError
 def renderurl_cached(path):
     # Needed so http://reddit.com/help/ works
     fp = path.rstrip("/")
-    u = "http://code.reddit.com/wiki" + fp + '?stripped=1'
+    u = "https://code.reddit.com/wiki" + fp + '?stripped=1'
 
     g.log.debug("Pulling %s for help" % u)
 
@@ -68,6 +72,7 @@ class EmbedController(RedditController):
                         content = Embed(content=output),
                         show_sidebar = None).render()
 
+    @csrf_exempt
     def renderurl(self, override=None):
         if override:
             path = override
@@ -82,9 +87,8 @@ class EmbedController(RedditController):
     GET_help = POST_help = renderurl
 
     def GET_blog(self):
-        return self.redirect("http://blog.%s/" %
-                             get_domain(cname = False, subreddit = False,
-                                        no_www = True))
+        return self.redirect("https://blog.%s/" %
+                             get_domain(subreddit=False, no_www=True))
 
     def GET_faq(self):
         if c.default_sr:

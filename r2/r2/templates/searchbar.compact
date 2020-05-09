@@ -16,34 +16,14 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
-<%!
-   from r2.lib.strings import strings
-   from r2.lib.pages import SearchForm
-%>
-
-<% isize = 60 %>
 <div class="searchpane raisedbox">
   <h4 style="color:gray">${thing.header}</h4>
 
   <div id="previoussearch">
-    ${SearchForm(prev_search = thing.prev_search,
-                 search_params = thing.search_params)}
+    ${thing.search_form}
   </div>
-
-  %if thing.prev_search and thing.elapsed_time > 0:
-    <div class="summary">
-      <%
-         label = _("about %(num)d results in %(second)s.")
-         seconds = strings.float_label % \
-              dict(num=thing.elapsed_time,
-                   thing=ungettext('second', 'seconds', 2))
-       %>
-      ${label % dict(num=thing.num_results, second=seconds)}
-    </div>
-    <div class="clearleft"></div>
-  %endif
 </div>

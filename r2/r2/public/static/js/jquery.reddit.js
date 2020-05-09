@@ -21,7 +21,7 @@ $.log = function(message) {
 };
 
 $.debug = function(message) {
-    if ($.with_default(reddit.debug, false)) {
+    if ($.with_default(r.config.debug, false)) {
         return $.log(message);
     }
 }
@@ -124,11 +124,11 @@ function release_ajax_lock(op) {
 };
 
 function handleResponse(action) {
-    return function(r) {
-        if(r.jquery) {
+    return function(res) {
+        if(res.jquery) {
             var objs = {};
             objs[0] = jQuery;
-            $.map(r.jquery, function(q) {
+            $.map(res.jquery, function(q) {
                     var old_i = q[0], new_i = q[1], op = q[2], args = q[3];
                     if (typeof(args) == "string") {
                       args = $.unsafe(args);
@@ -139,6 +139,10 @@ function handleResponse(action) {
                     if (op == "call") 
                         objs[new_i] = objs[old_i].apply(objs[old_i]._obj, args);
                     else if (op == "attr") {
+                        // remove beforeunload event handler if exists for redirects
+                        if(args == 'redirect') {
+                          $(window).off('beforeunload');
+                        }
                         objs[new_i] = objs[old_i][args];
                         if(objs[new_i])
                             objs[new_i]._obj = objs[old_i];
@@ -162,9 +166,8 @@ $.request = function(op, parameters, worker_in, block, type,
     /* 
        Uniquitous reddit AJAX poster.  Automatically addes
        handleResponse(action) worker to deal with the API result.  The
-       current subreddit (reddit.post_site), the user's modhash
-       (reddit.modhash) and whether or not we are in a frame
-       (reddit.cnameframe) are also automatically sent across.
+       current subreddit (r.config.post_site) and the user's modhash
+       (r.config.modhash) are also automatically sent across.
      */
     var action = op;
     var worker = worker_in;
@@ -176,7 +179,7 @@ $.request = function(op, parameters, worker_in, block, type,
         return
     }
 
-    if (window != window.top && !reddit.cnameframe && !reddit.external_frame) {
+    if (window != window.top) {
         return
     }
 
@@ -186,11 +189,24 @@ $.request = function(op, parameters, worker_in, block, type,
     parameters = $.with_default(parameters, {});
     worker_in  = $.with_default(worker_in, handleResponse(action));
     type  = $.with_default(type, "json");
+
+    var form = $('form.warn-on-unload');
+
     if (typeof(worker_in) != 'function')
         worker_in  = handleResponse(action);
-    var worker = function(r) {
+    var worker = function(res) {
         release_ajax_lock(action);
-        return worker_in(r);
+
+        /*
+         * check if there exists a form that has the
+         * warn-on-unload class. Remove the beforeunload event
+         * listener if the form submission was successful
+         * and we dont warn the user on succesful form submissions
+         */
+        if($(form).length && res.success) {
+          $(window).off('beforeunload');
+        }
+        return worker_in(res);
     };
     /* do the same for the error handler, and make sure to release the lock*/
     errorhandler_in = $.with_default(errorhandler, function() { });
@@ -200,26 +216,21 @@ $.request = function(op, parameters, worker_in, block, type,
     };
 
 
-
     get_only = $.with_default(get_only, false);
 
     /* set the subreddit name if there is one */
-    if (reddit.post_site) 
-        parameters.r = reddit.post_site;
-
-    /* flag whether or not we are on a cname */
-    if (reddit.cnameframe) 
-        parameters.cnameframe = 1;
+    if (r.config.post_site) 
+        parameters.r = r.config.post_site;
 
     /* add the modhash if the user is logged in */
-    if (reddit.logged) 
-        parameters.uh = reddit.modhash;
+    if (r.config.logged) 
+        parameters.uh = r.config.modhash;
 
-    parameters.renderstyle = reddit.renderstyle;
+    parameters.renderstyle = r.config.renderstyle;
 
     if(have_lock) {
         op = api_loc + op;
-        /*if( document.location.host == reddit.ajax_domain ) 
+        /*if( document.location.host == r.config.ajax_domain ) 
             /* normal AJAX post */
 
         $.ajax({ type: (get_only) ? "GET" : "POST",
@@ -229,7 +240,7 @@ $.request = function(op, parameters, worker_in, block, type,
                     error: errorhandler,
                     dataType: type});
         /*else { /* cross domain it is... * /
-            op = "http://" + reddit.ajax_domain + op + "?callback=?";
+            op = "http://" + r.config.ajax_domain + op + "?callback=?";
             $.getJSON(op, parameters, worker);
             } */
     }
@@ -244,7 +255,7 @@ rate_limit = (function() {
     var default_rate_limit = 333,  // default rate-limit duration (in ms)
         rate_limits = {  // rate limit per-action (in ms, 0 = don't rate limit)
             "vote": 333,
-            "comment": 5000,
+            "comment": 333,
             "ignore": 0,
             "ban": 0,
             "unban": 0,
@@ -267,54 +278,84 @@ rate_limit = (function() {
     };
 })()
 
+$.fn.removeLinkFlairClass = function () {
+  $(this)
+    .removeClass("linkflair")
+    .attr('class', function(i, c) {
+      return (c.replace(/(^|\s)linkflair\S+/g, ''));
+    });
+};
 
-$.fn.vote = function(vh, callback, event, ui_only) {
-    /* for vote to work, $(this) should be the clicked arrow */
-    if (reddit.logged && $(this).hasClass("arrow")) {
-        var dir = ( $(this).hasClass(up_cls) ? 1 :
-                    ( $(this).hasClass(down_cls) ? -1 : 0) );
-        var things = $(this).all_things_by_id();
-        /* find all arrows of things on the page */
-        var arrows = things.children().not(".child").find('.arrow');
+$.fn.updateThing = function(update) {
+    var $thing = $(this);
+    var $entry = $thing.children('.entry');
 
-        /* set the new arrow states */
-        var u_before = (dir == 1) ? up_cls : upmod_cls;
-        var u_after  = (dir == 1) ? upmod_cls : up_cls;
-        arrows.filter("."+u_before).removeClass(u_before).addClass(u_after);
-
-        var d_before = (dir == -1) ? down_cls : downmod_cls;
-        var d_after  = (dir == -1) ? downmod_cls : down_cls;
-        arrows.filter("."+d_before).removeClass(d_before).addClass(d_after);
-
-        /* let the user vote only if they are logged in */
-        if(reddit.logged) {
-            things.each(function() {
-                    var entry =  $(this).find(".entry:first, .midcol:first");
-                    if(dir > 0)
-                        entry.addClass('likes')
-                            .removeClass('dislikes unvoted');
-                    else if(dir < 0)
-                        entry.addClass('dislikes')
-                            .removeClass('likes unvoted');
-                    else
-                        entry.addClass('unvoted')
-                            .removeClass('likes dislikes');
-                });
-            if(!$.defined(ui_only)) {
-                var thing_id = things.filter(":first").thing_id();
-                /* IE6 hack */
-                vh += event ? "" : ("-" + thing_id); 
-                $.request("vote", {id: thing_id, dir : dir, vh : vh});
-            }
-        }
-        /* execute any callbacks passed in.  */
-        if(callback) 
-            callback(things, dir);
+    if ('enemy' in update) {
+        // TODO: this will hide comments of enemies along with all of their
+        // children.  The better alternative would be to make it render as
+        // deleted.
+        $thing.remove();
+        return;
     }
+
+    if ('friend' in update) {
+        var label = '<a class="friend" title="friend" href="/prefs/friends">F</a>';
+        
+        $entry.find('.author')
+              .addClass('friend')
+              .next('.userattrs')
+              .each(function() {
+                    var $this = $(this);
+
+                    if (!$this.html()) {
+                        $this.html(' [' + label + ']');
+                    } else if (!$this.find('.friend').length) {
+                        $this.find('a:first').before(label + ',');
+                    }
+              });
+    }
+
+    if ('voted' in update) {
+        var $midcol = $thing.children('.midcol');
+        var $up = $midcol.find('.arrow.'+up_cls+', .arrow.'+upmod_cls);
+        var $down = $midcol.find('.arrow.'+down_cls+', .arrow.'+downmod_cls);
+        var $elems = $($midcol).add($entry);
+
+        switch (update.voted) {
+            case 1:
+                $elems.addClass('likes').removeClass('dislikes unvoted');
+                $up.removeClass(up_cls).addClass(upmod_cls);
+                $down.removeClass(downmod_cls).addClass(down_cls);
+            break;
+            case -1:
+                $elems.addClass('dislikes').removeClass('likes unvoted');
+                $up.removeClass(upmod_cls).addClass(up_cls);
+                $down.removeClass(down_cls).addClass(downmod_cls);
+            break;
+            default:
+                $elems.addClass('unvoted').removeClass('likes dislikes');
+                $up.removeClass(upmod_cls).addClass(up_cls);
+                $down.removeClass(downmod_cls).addClass(down_cls);
+        }
+    }
+
+    if ('saved' in update) {
+        $thing.addClass('saved');
+        $entry.find('.save-button a')
+              .text(r._('unsave'));
+    }
+}
+
+$.fn.resetInput = function() {
+  var $el = $(this);
+  $el.wrap('<form>').closest('form').get(0).reset();
+  $el.unwrap();
+
+  return this;
 };
 
 $.fn.show_unvotable_message = function() {
-  $(this).thing().find(".entry:first .unvotable-message").css("display", "inline-block");
+  // deprecated
 };
 
 $.fn.thing = function() {
@@ -329,19 +370,24 @@ $.fn.all_things_by_id = function() {
     return this.thing().add( $.things(this.thing_id()) );
 };
 
-$.fn.thing_id = function(class_filter) {
-    class_filter = $.with_default(class_filter, "thing");
+$.fn.thing_id = function() {
     /* Returns the (reddit) ID of the current element's thing */
-    var t = (this.hasClass("thing")) ? this : this.thing();
-    if(class_filter != "thing") {
-        t = t.find("." + class_filter + ":first");
+    var t = this.hasClass('thing') ? this : this.thing();
+
+    if (!t.length) {
+        return '';
     }
-    if(t.length) {
-        var id = $.grep(t.get(0).className.match(/\S+/g),
-                        function(i) { return i.match(/^id-/); }); 
-        return (id.length) ? id[0].slice(3, id[0].length) : "";
+
+    var id = t.data('fullname');
+
+    if (id) {
+        return id;
     }
-    return "";
+
+    // fallback to old, clunky way of getting id from class
+    id = $.grep(t.get(0).className.match(/\S+/g),
+                function(i) { return i.match(/^id-/); }); 
+    return (id.length) ? id[0].slice(3, id[0].length) : '';
 };
 
 $.things = function() {
@@ -353,15 +399,6 @@ $.things = function() {
     var sel = $.map(arguments, function(x) { return ".thing.id-" + x; })
        .join(", ");
     return $(sel);
-};
-
-$.fn.same_author = function() {
-    var aid = $(this).thing_id("author");
-    var ids = [];
-    $(".author.id-" + aid).each(function() {
-            ids.push(".thing.id-" + $(this).thing_id());
-        });
-    return $(ids.join(", "));
 };
 
 $.fn.things = function() {
@@ -459,8 +496,8 @@ $.fn.replace_things = function(things, keep_children, reveal, stubs) {
      * case of a comment tree, flags whether or not the new thing has
      * the thread present) while "reveal" determines whether or not to
      * animate the transition from old to new. */
-    var self = this;
-    return $.map(things, function(thing) {
+    var self = this,
+        map = $.map(things, function(thing) {
             var data = thing.data;
             var existing = $(self).things(data.id);
             if(stubs) 
@@ -513,13 +550,15 @@ $.fn.replace_things = function(things, keep_children, reveal, stubs) {
             $(document).trigger('new_thing', new_thing)
             return new_thing;
         });
-    
+
+    $(document).trigger('new_things_inserted')
+    return map
 };
 
 
 $.insert_things = function(things, append) {
     /* Insert new things into a listing.*/
-    return $.map(things, function(thing) {
+    var map = $.map(things, function(thing) {
             var data = thing.data;
             var s = $.listing(data.parent);
             if(append)
@@ -530,7 +569,9 @@ $.insert_things = function(things, append) {
             thing_init_func(s.hide().show());
             $(document).trigger('new_thing', s)
             return s;
-        });
+        })
+    $(document).trigger('new_things_inserted')
+    return map
 };
 
 $.fn.delete_table_row = function(callback) {
@@ -553,27 +594,22 @@ $.fn.insert_table_rows = function(rows, index) {
      * the first parent of the current selection that is a table.*/
     var tables = ((this.is("table")) ? this.filter("table") : 
                   this.parents("table:first"));
-    
-    $.map(tables.get(), 
+    $.map(tables.get(),
           function(table) {
-              $.map(rows, function(thing) {
+              $.map(rows, function(row) {
                       var i = index;
-                      if(i < 0) 
+                      if(i < 0)
                           i = Math.max(table.rows.length + i + 1, 0);
                       i = Math.min(i, table.rows.length);
-                      /* create a new row and set its id and class*/
-                      var row = table.insertRow(i);
-                      $(row).hide().attr("id", thing.id)
-                          .addClass(thing.css_class);
-                      /* insert cells */
-                      $.map(thing.cells, function(cell) {
-                              $(row.insertCell(row.cells.length))
-                                  .html($.unsafe(cell))
-                                  .trigger("insert-cell");
-                          });
-                      $(row).trigger("insert-row");
-                      /* reveal! */
-                      $(row).fadeIn();
+
+                      var $newRow = $(table.insertRow(i)),
+                          $toInsert = $($.parseHTML($.unsafe(row)))
+
+                      $toInsert.hide()
+                      $newRow.replaceWith($toInsert)
+                      $toInsert.trigger("insert-row")
+                      $toInsert.css('display', 'table-row')
+                      $toInsert.fadeIn()
                   });
           });
     return this;
@@ -585,7 +621,7 @@ $.fn.captcha = function(iden) {
     var c = this.find(".capimage");
     if(iden) {
         c.attr("src", "/captcha/" + iden + ".png")
-            .parents("form").find('input[name="iden"]').val(iden);
+            .siblings('input[name="iden"]').val(iden);
     }
     return c;
 };
@@ -630,7 +666,8 @@ $.fn.insertAtCursor = function(value) {
 $.fn.select_line = function(lineNo) {
     return $(this).filter("textarea").each(function() {
             var newline = '\n', newline_length = 1, caret_pos = 0;
-            if ( $.browser.msie ) { /* IE hack */
+            var isIE = !!/msie [\w.]+/.exec( navigator.userAgent.toLowerCase() );
+            if ( isIE ) { /* IE hack */
                 newline = '\r';
                 newline_length = 0;
                 caret_pos = 1;
@@ -682,6 +719,10 @@ $.apply_stylesheet = function(cssText) {
          * that has the old stylesheet, and delete it. Then we add a
          * <style> with the new one */
         $("head").children('*[title="' + sheet_title + '"]').remove();
+
+        /* Hack to trigger a reflow so webkit browsers reset animations */
+        document.body.offsetHeight;
+
         var stylesheet = $('<style type="text/css" media="screen"></style>')
             .attr('title', sheet_title)
             .text(cssText)
@@ -690,20 +731,66 @@ $.apply_stylesheet = function(cssText) {
     
 };
 
-$.rehighlight_new_comments = function() {
-  checked = $(".comment-visits-box input:checked");
-  if (checked.length > 0) {
-    var v = checked[0].value;
-    highlight_new_comments(v);
+$.apply_stylesheet_url = function(cssUrl, srStyleEnabled) {
+  var sheetTitle = 'applied_subreddit_stylesheet';
+  var $stylesheet = $('link[title="' + sheetTitle + '"]');
+  if ($stylesheet.length == 0) {
+    $('head').append('<link type="text/css" title="' + sheetTitle + '" rel="stylesheet">');
+    $stylesheet = $('link[title="' + sheetTitle + '"]');
+  }
+
+  $stylesheet.attr("href", cssUrl);
+  $("#sr_style_enabled").prop("checked", srStyleEnabled);
+  $("#sr_style_throbber")
+    .html("")
+    .css("display", "none");
+};
+
+$.apply_header_image = function(src, size, title) {
+  var $headerImage = $("#header-img");
+  if ($headerImage.is("a")) {
+    $headerImage
+      .attr("id", "header-img-a")
+      .text("")
+      .append('<img id="header-img"/>');
+    $headerImage = $("#header-img");
+  }
+  $headerImage.removeClass("default-header");
+  $headerImage.attr("src", src);
+  $headerImage.attr("title", title);
+  if (size) {
+    $headerImage.attr("width", size[0]);
+    $headerImage.attr("height", size[1]);
+  } else {
+    $headerImage.removeAttr("width");
+    $headerImage.removeAttr("height");
   }
 }
 
-/* namespace globals for cookies -- default prefix and domain */
+$.remove_header_image = function() {
+  var $headerLink = $("#header-img-a");
+
+  if ($headerLink) {
+    $headerLink
+      .addClass("default-header")
+      .attr("id", "header-img")
+      .empty();
+    $("#header-img").empty();
+    $headerLink.attr("id", "header-img");
+  }
+}
+
+/* namespace globals for cookies -- default prefix, security and domain */
 var default_cookie_domain
 $.default_cookie_domain = function(domain) {
     if (domain) {
         default_cookie_domain = domain
     }
+}
+
+var default_cookie_security
+$.default_cookie_security = function(security) {
+    default_cookie_security = security
 }
 
 var cookie_name_prefix = "_"
@@ -720,6 +807,7 @@ $.cookie_write = function(c) {
         options.expires = c.expires
         options.domain = c.domain || default_cookie_domain
         options.path = c.path || '/'
+        options.secure = c.secure || default_cookie_security
 
         var key = cookie_name_prefix + c.name,
             value = c.data
@@ -744,5 +832,20 @@ $.cookie_read = function(name, prefix) {
 
     return {name: name, data: data}
 }
+
+$.fn.highlight = function(text) {
+  if (!text) { return this; }
+
+  var escaped = $.websafe(text.trim()).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  var regex = new RegExp("\\b" + escaped + "\\b", "gi");
+
+  return this.each(function() {
+    if (this.children.length) { return; }
+
+    this.innerHTML = this.innerHTML.replace(regex, function(matched) {
+      return "<mark>" + matched + "</mark>";
+    });
+  });
+};
 
 })(jQuery);

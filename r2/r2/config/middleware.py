@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -27,20 +27,26 @@ import urllib
 import tempfile
 import urlparse
 from threading import Lock
+import itertools
+import simplejson
 
 from paste.cascade import Cascade
+from paste.errordocument import StatusBasedForward
+from paste.recursive import RecursiveMiddleware
 from paste.registry import RegistryManager
 from paste.urlparser import StaticURLParser
 from paste.deploy.converters import asbool
-from pylons import config, response
-from pylons.middleware import ErrorDocuments, ErrorHandler
+from paste.request import path_info_split
+from pylons import response
+from pylons.middleware import ErrorHandler
 from pylons.wsgiapp import PylonsApp
 from routes.middleware import RoutesMiddleware
 
+from r2.config import hooks
 from r2.config.environment import load_environment
-from r2.config.rewrites import rewrites
 from r2.config.extensions import extension_mapping, set_extension
-from r2.lib.utils import is_subdomain
+from r2.lib.utils import is_subdomain, is_language_subdomain
+from r2.lib import csrf, filters
 
 
 # patch in WebOb support for HTTP 429 "Too Many Requests"
@@ -55,24 +61,25 @@ class HTTPTooManyRequests(webob.exc.HTTPClientError):
 webob.exc.status_map[429] = HTTPTooManyRequests
 webob.util.status_reasons[429] = HTTPTooManyRequests.title
 
-#from pylons.middleware import error_mapper
+# patch out SSRFable/XSSable endpoints in older versions of weberror
+import weberror.evalexception
+
+
+# We could probably just set `.exposed = False`, but this makes me feel better
+def _stub(*args, **kwargs):
+    pass
+
+weberror.evalexception.EvalException.post_traceback = _stub
+weberror.evalexception.EvalException.relay = _stub
+
+
 def error_mapper(code, message, environ, global_conf=None, **kw):
     if environ.get('pylons.error_call'):
         return None
     else:
         environ['pylons.error_call'] = True
 
-    from pylons import c
-
-    # c is not always registered with the paste registry by the time we get to
-    # this error_mapper. if it's not, we can safely assume that we didn't use
-    # the pagecache. one such case where this happens is the
-    # DomainMiddleware-based srname.reddit.com -> reddit.com/r/srname redirect.
-    try:
-        if c.used_cache:
-            return
-    except TypeError:
-        pass
+    from pylons import tmpl_context as c
 
     if global_conf is None:
         global_conf = {}
@@ -89,25 +96,17 @@ def error_mapper(code, message, environ, global_conf=None, **kw):
             error_data = getattr(exception, 'error_data', None)
             if error_data:
                 environ['extra_error_data'] = error_data
-        
-        if environ.get('REDDIT_CNAME'):
-            d['cnameframe'] = 1
+
         if environ.get('REDDIT_NAME'):
             d['srname'] = environ.get('REDDIT_NAME')
         if environ.get('REDDIT_TAKEDOWN'):
             d['takedown'] = environ.get('REDDIT_TAKEDOWN')
+        if environ.get('REDDIT_ERROR_NAME'):
+            d['error_name'] = environ.get('REDDIT_ERROR_NAME')
 
-        #preserve x-sup-id when 304ing
+        # preserve x-frame-options when 304ing
         if code == 304:
-            try:
-                # make sure that we're in a context where we can use SOP
-                # objects (error page statics appear to not be in this context)
-                response.headers
-            except TypeError:
-                pass
-            else:
-                if response.headers.has_key('x-sup-id'):
-                    d['x-sup-id'] = response.headers['x-sup-id']
+            d['allow_framing'] = 1 if c.allow_framing else 0
 
         extension = environ.get("extension")
         if extension:
@@ -115,6 +114,18 @@ def error_mapper(code, message, environ, global_conf=None, **kw):
         else:
             url = '/error/document/?%s' % (urllib.urlencode(d))
         return url
+
+
+# from pylons < 1.0
+def ErrorDocuments(app, global_conf, mapper, **kw):
+    """Wraps the app in error docs using Paste RecursiveMiddleware and
+    ErrorDocumentsMiddleware
+    """
+    if global_conf is None:
+        global_conf = {}
+
+    return RecursiveMiddleware(StatusBasedForward(
+        app, global_conf=global_conf, mapper=mapper, **kw))
 
 
 class ProfilingMiddleware(object):
@@ -140,13 +151,13 @@ class ProfilingMiddleware(object):
 
 
 class DomainMiddleware(object):
-    lang_re = re.compile(r"\A\w\w(-\w\w)?\Z")
 
-    def __init__(self, app):
+    def __init__(self, app, config):
         self.app = app
+        self.config = config
 
     def __call__(self, environ, start_response):
-        g = config['pylons.g']
+        g = self.config['pylons.app_globals']
         http_host = environ.get('HTTP_HOST', 'localhost').lower()
         domain, s, port = http_host.partition(':')
 
@@ -158,7 +169,9 @@ class DomainMiddleware(object):
 
         # localhost is exempt so paster run/shell will work
         # media_domain doesn't need special processing since it's just ads
-        if domain == "localhost" or is_subdomain(domain, g.media_domain):
+        is_media_only_domain = (is_subdomain(domain, g.media_domain) and
+                                g.domain != g.media_domain)
+        if domain == "localhost" or is_media_only_domain:
             return self.app(environ, start_response)
 
         # tell reddit_base to redirect to the appropriate subreddit for
@@ -167,29 +180,38 @@ class DomainMiddleware(object):
             environ['legacy-cname'] = domain
             return self.app(environ, start_response)
 
-        # figure out what subdomain we're on if any
-        subdomains = domain[:-len(g.domain) - 1].split('.')
-        extension_subdomains = dict(m="mobile",
-                                    i="compact",
-                                    api="api",
-                                    rss="rss",
-                                    xml="xml",
-                                    json="json")
+        # How many characters to chop off the end of the hostname before
+        # we start looking at subdomains
+        ignored_suffix_len = len(g.domain)
+
+        # figure out what subdomain we're on, if any
+        subdomains = domain[:-ignored_suffix_len - 1].split('.')
 
         sr_redirect = None
+        prefix_parts = []
         for subdomain in subdomains[:]:
+            extension = g.extension_subdomains.get(subdomain)
+            # These subdomains are reserved, don't treat them as SR
+            # or language subdomains.
             if subdomain in g.reserved_subdomains:
-                continue
-
-            extension = extension_subdomains.get(subdomain)
-            if extension:
+                # Some subdomains are reserved, but also can't be mixed into
+                # the domain prefix for various reasons (permalinks will be
+                # broken, etc.)
+                if subdomain in g.ignored_subdomains:
+                    continue
+                prefix_parts.append(subdomain)
+            elif extension:
                 environ['reddit-domain-extension'] = extension
-            elif self.lang_re.match(subdomain):
+            elif is_language_subdomain(subdomain):
                 environ['reddit-prefer-lang'] = subdomain
-                environ['reddit-domain-prefix'] = subdomain
             else:
                 sr_redirect = subdomain
                 subdomains.remove(subdomain)
+
+        if 'reddit-prefer-lang' in environ:
+            prefix_parts.insert(0, environ['reddit-prefer-lang'])
+        if prefix_parts:
+            environ['reddit-domain-prefix'] = '.'.join(prefix_parts)
 
         # if there was a subreddit subdomain, redirect
         if sr_redirect and environ.get("FULLPATH"):
@@ -198,7 +220,7 @@ class DomainMiddleware(object):
             subdomains.append(g.domain)
             redir = "%s/r/%s/%s" % ('.'.join(subdomains),
                                     sr_redirect, environ['FULLPATH'])
-            redir = "http://" + redir.replace('//', '/')
+            redir = g.default_scheme + "://" + redir.replace('//', '/')
 
             start_response("301 Moved Permanently", [("Location", redir)])
             return [""]
@@ -218,28 +240,27 @@ class SubredditMiddleware(object):
         if sr:
             environ['subreddit'] = sr.groups()[0]
             environ['PATH_INFO'] = self.sr_pattern.sub('', path) or '/'
-        elif path.startswith(('/subreddits', '/reddits')):
-            environ['subreddit'] = 'r'
         return self.app(environ, start_response)
 
-class DomainListingMiddleware(object):
-    domain_pattern = re.compile(r'\A/domain/(([-\w]+\.)+[\w]+)')
 
+class DomainListingMiddleware(object):
     def __init__(self, app):
         self.app = app
 
     def __call__(self, environ, start_response):
         if not environ.has_key('subreddit'):
             path = environ['PATH_INFO']
-            domain = self.domain_pattern.match(path)
-            if domain:
-                environ['domain'] = domain.groups()[0]
-                environ['PATH_INFO'] = self.domain_pattern.sub('', path) or '/'
+            domain, rest = path_info_split(path)
+            if domain == "domain" and rest:
+                domain, rest = path_info_split(rest)
+                environ['domain'] = domain
+                environ['PATH_INFO'] = rest or '/'
         return self.app(environ, start_response)
+
 
 class ExtensionMiddleware(object):
     ext_pattern = re.compile(r'\.([^/]+)\Z')
-    
+
     def __init__(self, app):
         self.app = app
 
@@ -264,31 +285,18 @@ class ExtensionMiddleware(object):
 
         return self.app(environ, start_response)
 
-class RewriteMiddleware(object):
+class FullPathMiddleware(object):
+    # Debt: we have a lot of middleware which (unfortunately) modify the
+    # global URL PATH_INFO string. To work with the original request URL, we
+    # save it to a different location here.
     def __init__(self, app):
         self.app = app
 
-    def rewrite(self, regex, out_template, input):
-        m = regex.match(input)
-        out = out_template
-        if m:
-            for num, group in enumerate(m.groups('')):
-                out = out.replace('$%s' % (num + 1), group)
-            return out
-
     def __call__(self, environ, start_response):
-        path = environ['PATH_INFO']
-        for r in rewrites:
-            newpath = self.rewrite(r[0], r[1], path)
-            if newpath:
-                environ['PATH_INFO'] = newpath
-                break
-
         environ['FULLPATH'] = environ.get('PATH_INFO')
         qs = environ.get('QUERY_STRING')
         if qs:
             environ['FULLPATH'] += '?' + qs
-
         return self.app(environ, start_response)
 
 class StaticTestMiddleware(object):
@@ -303,6 +311,22 @@ class StaticTestMiddleware(object):
             return self.app(environ, start_response)
         raise webob.exc.HTTPNotFound()
 
+
+def _wsgi_json(start_response, status_int, message=""):
+    status_message = webob.util.status_reasons[status_int]
+    message = message or status_message
+
+    start_response(
+        "%s %s" % (status_int, status_message),
+        [("Content-Type", "application/json")])
+
+    data = simplejson.dumps({
+        "error": status_int,
+        "message": message
+    })
+    return [filters.websafe_json(data).encode("utf-8")]
+
+
 class LimitUploadSize(object):
     """
     Middleware for restricting the size of uploaded files (such as
@@ -315,30 +339,42 @@ class LimitUploadSize(object):
     def __call__(self, environ, start_response):
         cl_key = 'CONTENT_LENGTH'
         is_error = environ.get("pylons.error_call", False)
+        is_api = environ.get("render_style").startswith("api")
         if not is_error and environ['REQUEST_METHOD'] == 'POST':
             if cl_key not in environ:
-                start_response("411 Length Required", [])
-                return ['<html><body>length required</body></html>']
+
+                if is_api:
+                    return _wsgi_json(start_response, 411)
+                else:
+                    start_response("411 Length Required", [])
+                    return ['<html><body>length required</body></html>']
 
             try:
                 cl_int = int(environ[cl_key])
             except ValueError:
-                start_response("400 Bad Request", [])
-                return ['<html><body>bad request</body></html>']
+                if is_api:
+                    return _wsgi_json(start_response, 400)
+                else:
+                    start_response("400 Bad Request", [])
+                    return ['<html><body>bad request</body></html>']
 
             if cl_int > self.max_size:
-                from r2.lib.strings import string_dict
-                error_msg = string_dict['css_validator_messages']['max_size'] % dict(max_size = self.max_size/1024)
-                start_response("413 Too Big", [])
-                return ["<html>"
-                        "<head>"
-                        "<script type='text/javascript'>"
-                        "parent.completedUploadImage('failed',"
-                        "'',"
-                        "'',"
-                        "[['BAD_CSS_NAME', ''], ['IMAGE_ERROR', '", error_msg,"']],"
-                        "'image-upload');"
-                        "</script></head><body>you shouldn\'t be here</body></html>"]
+                error_msg = "too big. keep it under %d KiB" % (
+                    self.max_size / 1024)
+
+                if is_api:
+                    return _wsgi_json(start_response, 413, error_msg)
+                else:
+                    start_response("413 Too Big", [])
+                    return ["<html>"
+                            "<head>"
+                            "<script type='text/javascript'>"
+                            "parent.completedUploadImage('failed',"
+                            "'',"
+                            "'',"
+                            "[['BAD_CSS_NAME', ''], ['IMAGE_ERROR', '", error_msg,"']],"
+                            "'');"
+                            "</script></head><body>you shouldn\'t be here</body></html>"]
 
         return self.app(environ, start_response)
 
@@ -369,29 +405,76 @@ class CleanupMiddleware(object):
         return self.app(environ, custom_start_response)
 
 
+class SafetyMiddleware(object):
+    """Clean up any attempts at response splitting in headers."""
+
+    has_bad_characters = re.compile("[\r\n]")
+    sanitizer = re.compile("[\r\n]+[ \t]*")
+
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        def safe_start_response(status, headers, exc_info=None):
+            sanitized = []
+            for name, value in headers:
+                if self.has_bad_characters.search(value):
+                    value = self.sanitizer.sub("", value)
+                sanitized.append((name, value))
+            return start_response(status, sanitized, exc_info)
+        return self.app(environ, safe_start_response)
+
+
 class RedditApp(PylonsApp):
+
+    test_mode = False
+
     def __init__(self, *args, **kwargs):
         super(RedditApp, self).__init__(*args, **kwargs)
         self._loading_lock = Lock()
         self._controllers = None
+        self._hooks_registered = False
 
     def setup_app_env(self, environ, start_response):
         PylonsApp.setup_app_env(self, environ, start_response)
-        self.load_controllers()
+
+        if not self.test_mode:
+            if self._controllers and self._hooks_registered:
+                return
+
+            with self._loading_lock:
+                self.load_controllers()
+                self.register_hooks()
+
+    def _check_csrf_prevention(self):
+        from r2 import controllers
+        from pylons import app_globals as g
+
+        if not g.running_as_script:
+            controllers_iter = itertools.chain(
+                controllers._reddit_controllers.itervalues(),
+                controllers._plugin_controllers.itervalues(),
+            )
+            for controller in controllers_iter:
+                csrf.check_controller_csrf_prevention(controller)
 
     def load_controllers(self):
         if self._controllers:
             return
 
-        with self._loading_lock:
-            if self._controllers:
-                return
+        controllers = importlib.import_module(self.package_name +
+                                              '.controllers')
+        controllers.load_controllers()
+        self.config['r2.plugins'].load_controllers()
+        self._controllers = controllers
+        self._check_csrf_prevention()
 
-            controllers = importlib.import_module(self.package_name +
-                                                  '.controllers')
-            controllers.load_controllers()
-            config['r2.plugins'].load_controllers()
-            self._controllers = controllers
+    def register_hooks(self):
+        if self._hooks_registered:
+            return
+
+        hooks.register_hooks()
+        self._hooks_registered = True
 
     def find_controller(self, controller_name):
         if controller_name in self.controller_classes:
@@ -420,11 +503,11 @@ def make_app(global_conf, full_stack=True, **app_conf):
     """
 
     # Configure the Pylons environment
-    load_environment(global_conf, app_conf)
-    g = config['pylons.g']
+    config = load_environment(global_conf, app_conf)
+    g = config['pylons.app_globals']
 
     # The Pylons WSGI app
-    app = RedditApp()
+    app = RedditApp(config=config)
     app = RoutesMiddleware(app, config["routes.map"])
 
     # CUSTOM MIDDLEWARE HERE (filtered by the error handling middlewares)
@@ -441,7 +524,7 @@ def make_app(global_conf, full_stack=True, **app_conf):
     app = DomainListingMiddleware(app)
     app = SubredditMiddleware(app)
     app = ExtensionMiddleware(app)
-    app = DomainMiddleware(app)
+    app = DomainMiddleware(app, config=config)
 
     if asbool(full_stack):
         # Handle Python exceptions
@@ -449,7 +532,7 @@ def make_app(global_conf, full_stack=True, **app_conf):
 
         # Display error documents for 401, 403, 404 status codes (and 500 when
         # debug is disabled)
-        app = ErrorDocuments(app, global_conf, mapper=error_mapper, **app_conf)
+        app = ErrorDocuments(app, global_conf, error_mapper, **app_conf)
 
     # Establish the Registry for this application
     app = RegistryManager(app)
@@ -464,11 +547,14 @@ def make_app(global_conf, full_stack=True, **app_conf):
         static_cascade.insert(0, plugin_static_apps)
     app = Cascade(static_cascade)
 
-    #add the rewrite rules
-    app = RewriteMiddleware(app)
+    app = FullPathMiddleware(app)
 
     if not g.config['uncompressedJS'] and g.config['debug']:
         static_fallback = StaticTestMiddleware(static_app, g.config['static_path'], g.config['static_domain'])
         app = Cascade([static_fallback, app])
+
+    app = SafetyMiddleware(app)
+
+    app.config = config
 
     return app

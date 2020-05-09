@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -24,42 +24,57 @@
 <%namespace file="utils.html" import="plain_link" />
 
 <%def name="midcol(display=True, cls = '')">
-  %if c.profilepage or (not thing._deleted and  (not thing._spam or thing.is_author or c.user_is_admin)):
-    ${parent.midcol(display=display, cls = cls)}
-  %endif
+  ${parent.midcol(display=display, cls = cls)}
 </%def>
 
-<%def name="tagline(collapse=False)">
+<%def name="tagline()">
 </%def>
 
-<%def name="collapsed()">
-${self.tagline(True)}
+<%def name="buttons()">
+</%def>
+
+<%def name="arrows()">
 </%def>
 
 <%def name="commentBody()">
   ${thing.usertext}
 </%def>
 
+<%def name="thing_css_class(what)">
+  ${parent.thing_css_class(what)} ${"stickied" if getattr(thing, 'is_sticky', None) else ""} ${"collapsed" if thing.collapsed else "noncollapsed"} ${"collapsed-for-reason" if hasattr(thing, "collapsed_reason") else ""}
+</%def>
+
+<%def name="thing_data_attributes(what)">
+  ${parent.thing_data_attributes(what)}
+
+  %if hasattr(what, 'subreddit'):
+    data-subreddit="${what.subreddit.name}"
+    data-subreddit-fullname="${what.subreddit._fullname}"
+  %endif
+
+  %if not getattr(what, 'deleted', False) and getattr(what, 'author', False):
+    data-author="${what.author.name}"
+    data-author-fullname="${what.author._fullname}"
+  %endif
+
+  %if getattr(what, 'can_ban', False):
+    data-can-ban="true"
+  %endif
+</%def>
 
 <%def name="entry()">
 <%
    from r2.lib.strings import strings
-   collapse = thing.collapsed
 %>
 
-<div class="collapsed" ${(not collapse and "style='display:none'" or "")}>
-  ${self.collapsed()}
-</div>
-<div class="noncollapsed" ${(collapse and "style='display:none'" or "")}>
-  <p class="tagline">
-    ${self.tagline()}
-%if not getattr(thing, "votable", True):
-    <div class="unvotable-message">${strings.unvotable_message}</div>
-%endif
-  </p>
-  ${self.commentBody()}
-  <ul class="flat-list buttons">
-    ${self.buttons()}
-  </ul>
-</div>
+<p class="tagline">
+  ${self.tagline()}
+</p>
+
+${self.commentBody()}
+
+<ul class="flat-list buttons">
+  ${self.buttons()}
+</ul>
+<div class="reportform report-${thing._fullname}"></div>
 </%def>

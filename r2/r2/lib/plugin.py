@@ -16,17 +16,14 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-import site
 import sys
 import os.path
 import pkg_resources
 from collections import OrderedDict
-
-from pylons import config
 
 
 class Plugin(object):
@@ -36,6 +33,7 @@ class Plugin(object):
     needs_static_build = False
     needs_translation = True
     errors = {}
+    source_root_url = None
 
     def __init__(self, entry_point):
         self.entry_point = entry_point
@@ -81,17 +79,13 @@ class Plugin(object):
     def load_controllers(self):
         pass
 
+    def get_documented_controllers(self):
+        return []
 
 
 class PluginLoader(object):
-    def __init__(self, plugin_names=None):
-        # reloading site ensures that we have a fresh sys.path to build our
-        # working set off of. this means that forked worker processes won't get
-        # the sys.path that was current when the master process was spawned
-        # meaning that new plugins will be picked up on regular app reload
-        # rather than having to restart the master process as well.
-        reload(site)
-        self.working_set = pkg_resources.WorkingSet(sys.path)
+    def __init__(self, working_set=None, plugin_names=None):
+        self.working_set = working_set or pkg_resources.WorkingSet()
 
         if plugin_names is None:
             entry_points = self.available_plugins()
@@ -140,8 +134,8 @@ class PluginLoader(object):
         for plugin in self:
             plugin.declare_queues(queues)
 
-    def load_plugins(self):
-        g = config['pylons.g']
+    def load_plugins(self, config):
+        g = config['pylons.app_globals']
         for plugin in self:
             # Record plugin version
             entry = plugin.entry_point
@@ -162,3 +156,8 @@ class PluginLoader(object):
         for plugin in self:
             errors.add_error_codes(plugin.errors)
             plugin.load_controllers()
+
+    def get_documented_controllers(self):
+        for plugin in self:
+            for controller, url_prefix in plugin.get_documented_controllers():
+                yield controller, url_prefix

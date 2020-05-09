@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -28,7 +28,10 @@ import operators
 import re
 import threading
 
-from pylons import g, c, request
+from pylons import request
+from pylons import tmpl_context as c
+from pylons import app_globals as g
+
 import sqlalchemy as sa
 
 from r2.lib import filters
@@ -105,6 +108,7 @@ class TransactionSet(threading.local):
 transactions = TransactionSet()
 
 MAX_THING_ID = 9223372036854775807 # http://www.postgresql.org/docs/8.3/static/datatype-numeric.html
+MIN_THING_ID = 0
 
 def make_metadata(engine):
     metadata = sa.MetaData(engine)
@@ -138,15 +142,12 @@ def index_commands(table, type):
     commands = []
 
     if type == 'thing':
-        commands.append(index_str(table, 'id', 'thing_id'))
         commands.append(index_str(table, 'date', 'date'))
         commands.append(index_str(table, 'deleted_spam', 'deleted, spam'))
         commands.append(index_str(table, 'hot', 'hot(ups, downs, date), date'))
         commands.append(index_str(table, 'score', 'score(ups, downs), date'))
         commands.append(index_str(table, 'controversy', 'controversy(ups, downs), date'))
     elif type == 'data':
-        commands.append(index_str(table, 'id', 'thing_id'))
-        commands.append(index_str(table, 'thing_id', 'thing_id'))
         commands.append(index_str(table, 'key_value', 'key, substring(value, 1, %s)' \
                                   % max_val_len))
 
@@ -268,7 +269,7 @@ def check_type(table, name, insert_vals):
     r = table.select(table.c.name == name).execute().fetchone()
     if not r:
         r = table.insert().execute(**insert_vals)
-        type_id = r.last_inserted_ids()[0]
+        type_id = r.inserted_primary_key[0]
     else:
         type_id = r.id
     return type_id
@@ -352,12 +353,6 @@ def build_rel_tables():
         rel_types_name[name] = rel
 build_rel_tables()
 
-def get_type_id(name):
-    return types_name[name][0]
-
-def get_rel_type_id(name):
-    return rel_types_name[name][0]
-
 def get_write_table(tables):
     if g.disallow_db_writes:
         raise Exception("not so fast! writes are not allowed on this app.")
@@ -428,7 +423,7 @@ def make_thing(type_id, ups, downs, date, deleted, spam, id=None):
     def do_insert(t):
         transactions.add_engine(t.bind)
         r = t.insert().execute(**params)
-        new_id = r.last_inserted_ids()[0]
+        new_id = r.inserted_primary_key[0]
         new_r = r.last_inserted_params()
         for k, v in params.iteritems():
             if new_r[k] != v:
@@ -439,7 +434,6 @@ def make_thing(type_id, ups, downs, date, deleted, spam, id=None):
     try:
         id = do_insert(table)
         params['thing_id'] = id
-        g.stats.event_count('thing.create', table.thing_name)
         return id
     except sa.exc.DBAPIError, e:
         if not 'IntegrityError' in e.message:
@@ -488,8 +482,7 @@ def make_relation(rel_type_id, thing1_id, thing2_id, name, date=None):
                                    thing2_id = thing2_id,
                                    name = name, 
                                    date = date)
-        g.stats.event_count('rel.create', table.rel_name)
-        return r.last_inserted_ids()[0]
+        return r.inserted_primary_key[0]
     except sa.exc.DBAPIError, e:
         if not 'IntegrityError' in e.message:
             raise
@@ -810,7 +803,7 @@ def translate_thing_value(rval):
         return rval
 
 #will assume parameters start with a _ for consistency
-def find_things(type_id, get_cols, sort, limit, constraints):
+def find_things(type_id, sort, limit, offset, constraints):
     table = get_thing_table(type_id)[0]
     constraints = deepcopy(constraints)
 
@@ -832,13 +825,16 @@ def find_things(type_id, get_cols, sort, limit, constraints):
     if limit:
         s = s.limit(limit)
 
+    if offset:
+        s = s.offset(offset)
+
     try:
         r = add_request_info(s).execute()
     except Exception, e:
         dbm.mark_dead(table.bind)
         # this thread must die so that others may live
         raise
-    return Results(r, lambda(row): row if get_cols else row.thing_id)
+    return Results(r, lambda(row): row.thing_id)
 
 def translate_data_value(alias, op):
     lval = op.lval
@@ -857,7 +853,7 @@ def translate_data_value(alias, op):
 
 #TODO sort by data fields
 #TODO sort by id wants thing_id
-def find_data(type_id, get_cols, sort, limit, constraints):
+def find_data(type_id, sort, limit, offset, constraints):
     t_table, d_table = get_thing_table(type_id)
     constraints = deepcopy(constraints)
 
@@ -914,6 +910,9 @@ def find_data(type_id, get_cols, sort, limit, constraints):
     if limit:
         s = s.limit(limit)
 
+    if offset:
+        s = s.offset(offset)
+
     try:
         r = add_request_info(s).execute()
     except Exception, e:
@@ -921,17 +920,70 @@ def find_data(type_id, get_cols, sort, limit, constraints):
         # this thread must die so that others may live
         raise
 
-    return Results(r, lambda(row): row if get_cols else row.thing_id)
+    return Results(r, lambda(row): row.thing_id)
 
 
-def find_rels(rel_type_id, get_cols, sort, limit, constraints):
+def sort_thing_ids_by_data_value(type_id, thing_ids, value_name,
+        limit=None, desc=False):
+    """Order thing_ids by the value of a data column."""
+
+    thing_table, data_table = get_thing_table(type_id)
+
+    join = thing_table.join(data_table,
+        data_table.c.thing_id == thing_table.c.thing_id)
+
+    query = (sa.select(
+            [thing_table.c.thing_id],
+            sa.and_(
+                thing_table.c.thing_id.in_(thing_ids),
+                thing_table.c.deleted == False,
+                thing_table.c.spam == False,
+                data_table.c.key == value_name,
+            )
+        )
+        .select_from(join)
+    )
+
+    sort_column = data_table.c.value
+    if desc:
+        sort_column = sa.desc(sort_column)
+    query = query.order_by(sort_column)
+
+    if limit:
+        query = query.limit(limit)
+
+    rows = query.execute()
+
+    return Results(rows, lambda(row): row.thing_id)
+
+
+def find_rels(ret_props, rel_type_id, sort, limit, offset, constraints):
     tables = get_rel_table(rel_type_id)
     r_table, t1_table, t2_table, d_table = tables
     constraints = deepcopy(constraints)
 
     t1_table, t2_table = t1_table.alias(), t2_table.alias()
 
-    s = sa.select([r_table.c.rel_id.label('rel_id')])
+    prop_to_column = {
+        "_rel_id": r_table.c.rel_id.label('rel_id'),
+        "_thing1_id": r_table.c.thing1_id.label('thing1_id'),
+        "_thing2_id": r_table.c.thing2_id.label('thing2_id'),
+        "_name": r_table.c.name.label('name'),
+        "_date": r_table.c.date.label('date'),
+    }
+
+    if not ret_props:
+        valid_props = ', '.join(prop_to_column.keys())
+        raise ValueError("ret_props must contain at least one of " + valid_props)
+
+    columns = []
+    for prop in ret_props:
+        if prop not in prop_to_column:
+            raise ValueError("ret_props got unrecognized %s" % prop)
+
+        columns.append(prop_to_column[prop])
+
+    s = sa.select(columns)
     need_join1 = ('thing1_id', t1_table)
     need_join2 = ('thing2_id', t2_table)
     joins_needed = set()
@@ -973,23 +1025,28 @@ def find_rels(rel_type_id, get_cols, sort, limit, constraints):
         s.append_whereclause(sa_op(op))
 
     if sort:
-        s, cols = add_sort(sort,
-                           {'_':r_table, '_t1_':t1_table, '_t2_':t2_table},
-                           s)
-        
+        s, cols = add_sort(
+            sort=sort,
+            t_table={'_': r_table, '_t1_': t1_table, '_t2_': t2_table},
+            select=s,
+        )
+
         #do we need more joins?
         for (col, table) in cols:
             if table == need_join1[1]:
                 joins_needed.add(need_join1)
             elif table == need_join2[1]:
                 joins_needed.add(need_join2)
-        
+
     for j in joins_needed:
         col, table = j
-        s.append_whereclause(r_table.c[col] == table.c.thing_id)    
+        s.append_whereclause(r_table.c[col] == table.c.thing_id)
 
     if limit:
         s = s.limit(limit)
+
+    if offset:
+        s = s.offset(offset)
 
     try:
         r = add_request_info(s).execute()
@@ -997,10 +1054,21 @@ def find_rels(rel_type_id, get_cols, sort, limit, constraints):
         dbm.mark_dead(r_table.bind)
         # this thread must die so that others may live
         raise
-    return Results(r, lambda (row): (row if get_cols else row.rel_id))
+
+    def build_fn(row):
+        # return Storage objects with just the requested props
+        props = {}
+        for prop in ret_props:
+            db_prop = prop[1:]  # column name doesn't have _ prefix
+            props[prop] = getattr(row, db_prop)
+        return storage(**props)
+
+    return Results(sa_ResultProxy=r, build_fn=build_fn)
+
 
 if logging.getLogger('sqlalchemy').handlers:
     logging.getLogger('sqlalchemy').handlers[0].formatter = log_format
+
 
 #inconsitencies:
 

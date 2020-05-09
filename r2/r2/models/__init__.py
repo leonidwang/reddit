@@ -16,16 +16,17 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from account import *
+from ip import *
 from link import *
 from listing import *
-from builder import *
 from vote import *
 from report import *
+from rules import *
 from subreddit import *
 from flair import *
 from award import *
@@ -36,3 +37,8 @@ from admintools import *
 from token import *
 from modaction import *
 from promo import *
+
+# r2.models.builder will import other models, so pulling its classes/vars into
+# r2.models needs to be done last to ensure that the models it depends
+# on are already loaded.
+from builder import *

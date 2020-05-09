@@ -10,31 +10,32 @@ $(function() {
         }
     }
 
-    function onDelete(action) {
-        return post_form(this.parentNode, action);
-    }
-
-    function makeOnDelete(action) {
-        return function() { return onDelete.call(this, action); };
+    function onDelete(e) {
+        e.preventDefault()
+        return post_form(this.parentNode, e.data.action);
     }
 
     function onFocus() {
         showSaveButton(this);
     }
 
-    function onSubmit(action) {
+    function onSubmit(e) {
+        e.preventDefault()
         $(this).removeClass("edited");
-        return post_form(this, action);
-    }
-
-    function makeOnSubmit(action) {
-        return function() { return onSubmit.call(this, action); };
+        return post_form(this, e.data.action);
     }
 
     function toggleFlairSelector() {
         open_menu(this);
         $(this).addClass("active");
         return false;
+    }
+
+    function getFlairAttrs($el) {
+        if ($el.data('name')) {
+            return {name: $el.data('name')}
+        }
+        return {link: $el.thing_id()}
     }
 
     function selectFlairInSelector(e) {
@@ -75,12 +76,17 @@ $(function() {
     }
 
     function postFlairSelection(e) {
-        $(this).parent().parent().siblings("input").val(this.id);
-        post_form(this.parentNode.parentNode.parentNode, "selectflair");
+        $(this).find(".status").html(r.config.status_msg.submitting).show()
+        var $btn = $(this.parentNode.parentNode).find('.flairselectbtn')
+        simple_post_form(this, "selectflair", getFlairAttrs($btn));
         return false;
     }
 
     function openFlairSelector(e) {
+        if (r.access.isLinkRestricted(e.target)) {
+            return false;
+        }
+
         close_menus(e);
 
         var button = this;
@@ -177,30 +183,37 @@ $(function() {
                  ($(button).position().left + $(button).width() - 18) + "px")
             .css("top", $(button).position().top + "px");
 
-        var params = {};
-        $(selector).siblings("form").find("input").each(
-            function(idx, inp) {
-                params[inp.name] = inp.value;
-            });
-        $.request("flairselector", params, handleResponse, true, "html");
+        var attrs = getFlairAttrs($(this))
+        $.request("flairselector",  attrs, handleResponse, true, "html");
         return false;
     }
 
     // Attach event handlers to the various flair forms that may be on page.
+
+    $("#tabbedpane-grant").on("submit",  ".flair-entry", {
+        action: "flair",
+      }, onSubmit)
+
+    $("#tabbedpane-grant").on("click", ".flairdeletebtn", {
+        action: "deleteflair",
+      }, onDelete)
+
+
+    $("#tabbedpane-templates, #tabbedpane-link_templates").on("submit", ".flair-entry", {
+          action: "flairtemplate",
+      }, onSubmit)
+
+    $("form.clearflairtemplates").on("submit", {
+        action: "clearflairtemplates"
+      }, onSubmit)
+
     $(".flairlist")
-        .delegate(".flairtemplate form", "submit",
-                  makeOnSubmit('flairtemplate'))
-        .delegate("form.clearflairtemplates", "submit",
-                  makeOnSubmit('clearflairtemplates'))
-        .delegate(".flairgrant .usertable form", "submit",
-                  makeOnSubmit('flair'))
-        .delegate(".flaircell input", "focus", onFocus)
-        .delegate(".flaircell input", "keyup", onEdit)
-        .delegate(".flaircell input", "change", onEdit)
-        .delegate(".flairtemplate .flairdeletebtn", "click",
-                  makeOnDelete("deleteflairtemplate"))
-        .delegate(".flairgrant .flairdeletebtn", "click",
-                  makeOnDelete("deleteflair"));
+        .on("focus", ".flaircell input", onFocus)
+        .on("keyup", ".flaircell input", onEdit)
+        .on("change", ".flaircell input", onEdit)
+        .on("click", ".flairtemplate .flairdeletebtn", {
+            action: "deleteflairtemplate",
+          }, onDelete)
 
     // Event handlers for sidebar flair prefs.
     $(".flairtoggle").submit(function() {

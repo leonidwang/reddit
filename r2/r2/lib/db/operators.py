@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -40,7 +40,7 @@ class op(object):
     def __repr__(self):
         return '<%s: %s, %s>' % (self.__class__.__name__, self.lval, self.rval)
 
-    #sorts in a consistent order, required for Query._iden()
+    # sorts in a consistent order, required for Query._cache_key()
     def __cmp__(self, other):
         return cmp(repr(self), repr(other))
 
@@ -121,7 +121,11 @@ class sort(object):
         return '<sort:%s %s>' % (self.__class__.__name__, str(self.col))
 
     def __eq__(self, other):
-        return self.col == other.col
+        return self.__class__ == other.__class__ and self.col == other.col
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
 
 class asc(sort): pass
 class desc(sort):pass

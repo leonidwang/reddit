@@ -16,12 +16,13 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 import sys
 from itertools import imap, groupby
+from heapq import nlargest
 
 stdin = sys.stdin
 stderr = sys.stderr
@@ -194,20 +195,14 @@ def dataspec_m_thing(*fields):
 
 def mr_reduce_max_per_key(sort_key, post = None, num = 10, fd = sys.stdin):
     def process(key, vals):
-        cdef list maxes = []
-
-        # pull items out in chunks (of the total number that we want),
-        # sorting and slicing after each batch
-        for val_chunk in in_chunks(vals, num):
-            maxes.extend(val_chunk)
-            maxes.sort(reverse=True, key=sort_key)
-            maxes = maxes[:num]
+        cdef list maxes = nlargest(num, vals, key=sort_key)
 
         if post:
             # if we were passed a "post" function, he takes
             # responsibility for emitting
             post(key, maxes)
             return []
+
         return [ ([key] + item)
                  for item in maxes ]
 

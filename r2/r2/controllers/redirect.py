@@ -16,19 +16,26 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
+
 from pylons import request
-from pylons.controllers.util import abort, redirect_to
+from pylons import tmpl_context as c
+from pylons.controllers.util import abort
 
 from r2.lib.base import BaseController
-from r2.lib.validator import chkuser, chksrname
+from r2.lib.validator import chkuser
+from r2.models import Subreddit
 
 
 class RedirectController(BaseController):
+    def pre(self, *k, **kw):
+        BaseController.pre(self, *k, **kw)
+        c.extension = request.environ.get('extension')
+
     def GET_redirect(self, dest):
-        return redirect_to(str(dest))
+        return self.redirect(str(dest))
 
     def GET_user_redirect(self, username, rest=None):
         user = chkuser(username)
@@ -39,17 +46,14 @@ class RedirectController(BaseController):
             url += "/" + rest
         if request.query_string:
             url += "?" + request.query_string
-        return redirect_to(str(url), _code=301)
+        return self.redirect(str(url), code=301)
 
     def GET_timereddit_redirect(self, timereddit, rest=None):
-        tr_name = chksrname(timereddit)
-        if not tr_name:
+        sr_name = "t:" + timereddit
+        if not Subreddit.is_valid_name(sr_name, allow_time_srs=True):
             abort(400)
         if rest:
             rest = str(rest)
         else:
             rest = ''
-        return redirect_to("/r/t:%s/%s" % (tr_name, rest), _code=301)
-
-    def GET_gilded_comments(self):
-        return redirect_to("/r/all/comments/gilded", _code=301)
+        return self.redirect("/r/%s/%s" % (sr_name, rest), code=301)

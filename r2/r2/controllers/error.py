@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -28,19 +28,29 @@ import pylons
 
 from webob.exc import HTTPFound, HTTPMovedPermanently
 from pylons.i18n import _
-from pylons import c, g, request, response
+from pylons import request, response
+from pylons import tmpl_context as c
+from pylons import app_globals as g
+
 
 try:
     # place all r2 specific imports in here.  If there is a code error, it'll
     # get caught and the stack trace won't be presented to the user in
     # production
     from r2.config import extensions
-    from r2.controllers.reddit_base import RedditController, Cookies
+    from r2.controllers.reddit_base import RedditController, UnloggedUser
+    from r2.lib.cookies import Cookies
     from r2.lib.errors import ErrorSet
-    from r2.lib.filters import websafe_json
+    from r2.lib.filters import (
+        safemarkdown,
+        scriptsafe_dumps,
+        websafe,
+        websafe_json,
+    )
     from r2.lib import log, pages
-    from r2.lib.strings import rand_strings
+    from r2.lib.strings import get_funny_translated_string
     from r2.lib.template_helpers import static
+    from r2.lib.base import abort
     from r2.models.link import Link
     from r2.models.subreddit import DefaultSR, Subreddit
 except Exception, e:
@@ -90,6 +100,12 @@ class ErrorController(RedditController):
     This behaviour can be altered by changing the parameters to the
     ErrorDocuments middleware in your config/middleware.py file.
     """
+    # Handle POST endpoints redirecting to the error controller
+    handles_csrf = True
+
+    def check_for_bearer_token(self):
+        pass
+
     allowed_render_styles = ('html', 'xml', 'js', 'embed', '', "compact", 'api')
     # List of admins to blame (skip the first admin, "reddit")
     # If list is empty, just blame "an admin"
@@ -104,6 +120,12 @@ class ErrorController(RedditController):
         except Exception as e:
             handle_awful_failure("ErrorController.__before__: %r" % e)
 
+        # c.error_page is special-cased in a couple places to bypass
+        # c.site checks. We shouldn't allow the user to get here other
+        # than through `middleware.py:error_mapper`.
+        if not request.environ.get('pylons.error_call'):
+            abort(403, "direct access to error controller disallowed")
+
     def __after__(self): 
         try:
             RedditController.__after__(self)
@@ -116,6 +138,16 @@ class ErrorController(RedditController):
         except Exception as e:
             return handle_awful_failure("ErrorController.__call__: %r" % e)
 
+
+    def send400(self):
+        if 'usable_error_content' in request.environ:
+            return request.environ['usable_error_content']
+        else:
+            res = pages.RedditError(
+                title=_("bad request (%(domain)s)") % dict(domain=g.domain),
+                message=_("you sent an invalid request"),
+                explanation=request.GET.get('explanation'))
+            return res.render()
 
     def send403(self):
         c.site = DefaultSR()
@@ -143,7 +175,10 @@ class ErrorController(RedditController):
             template_name = '/ratelimit_throttled.html'
 
         template = g.mako_lookup.get_template(template_name)
-        return template.render(logo_url=static(g.default_header_url))
+        return template.render(
+            logo_url=static(g.default_header_url),
+            retry_after=retry_after,
+        )
 
     def send503(self):
         retry_after = request.environ.get("retry_after")
@@ -163,39 +198,61 @@ class ErrorController(RedditController):
             except ValueError:
                 code = 404
             srname = request.GET.get('srname', '')
-            takedown = request.GET.get('takedown', "")
+            takedown = request.GET.get('takedown', '')
+            error_name = request.GET.get('error_name', '')
 
-            # StatusBasedRedirect will override this anyway, but we need this
-            # here for pagecache to see.
-            response.status_int = code
+            if isinstance(c.user, basestring):
+                # somehow requests are getting here with c.user unset
+                c.user_is_loggedin = False
+                c.user = UnloggedUser(browser_langs=None)
 
             if srname:
                 c.site = Subreddit._by_name(srname)
 
+            if request.GET.has_key('allow_framing'):
+                c.allow_framing = bool(request.GET['allow_framing'] == '1')
+
+            if (error_name == 'IN_TIMEOUT' and
+                    not 'usable_error_content' in request.environ):
+                timeout_days_remaining = c.user.days_remaining_in_timeout
+
+                errpage = pages.InterstitialPage(
+                    _("suspended"),
+                    content=pages.InTimeoutInterstitial(
+                        timeout_days_remaining=timeout_days_remaining,
+                    ),
+                )
+                request.environ['usable_error_content'] = errpage.render()
+
             if code in (204, 304):
                 # NEVER return a content body on 204/304 or downstream
                 # caches may become very confused.
-                if request.GET.has_key('x-sup-id'):
-                    x_sup_id = request.GET.get('x-sup-id')
-                    if '\r\n' not in x_sup_id:
-                        response.headers['x-sup-id'] = x_sup_id
                 return ""
             elif c.render_style not in self.allowed_render_styles:
                 return str(code)
             elif c.render_style in extensions.API_TYPES:
                 data = request.environ.get('extra_error_data', {'error': code})
+                message = request.GET.get('message', '')
+                if message:
+                    data['message'] = message
+                if request.environ.get("WANT_RAW_JSON"):
+                    return scriptsafe_dumps(data)
                 return websafe_json(json.dumps(data))
             elif takedown and code == 404:
                 link = Link._by_fullname(takedown)
                 return pages.TakedownPage(link).render()
+            elif code == 400:
+                return self.send400()
             elif code == 403:
                 return self.send403()
             elif code == 429:
                 return self.send429()
             elif code == 500:
-                randmin = {'admin': random.choice(self.admins)}
                 failien_url = make_failien_url()
-                return redditbroke % (failien_url, rand_strings.sadmessages % randmin)
+                sad_message = get_funny_translated_string("500_page")
+                sad_message %= {'admin': random.choice(self.admins)}
+                sad_message = safemarkdown(sad_message)
+                return redditbroke % (failien_url, sad_message)
             elif code == 503:
                 return self.send503()
             elif c.site:
@@ -205,7 +262,11 @@ class ErrorController(RedditController):
         except Exception as e:
             return handle_awful_failure("ErrorController.GET_document: %r" % e)
 
-    POST_document = PUT_document = DELETE_document = GET_document
+    POST_document = GET_document
+    PUT_document = GET_document
+    PATCH_document = GET_document
+    DELETE_document = GET_document
+
 
 def handle_awful_failure(fail_text):
     """
@@ -223,7 +284,7 @@ def handle_awful_failure(fail_text):
         log.write_error_summary(fail_text)
         for line in traceback.format_exc().splitlines():
             g.log.error(line)
-        return redditbroke % (make_failien_url(), fail_text)
+        return redditbroke % (make_failien_url(), websafe(fail_text))
     except:
         # we are doomed.  Admit defeat
         return "This is an error that should never occur.  You win."

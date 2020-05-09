@@ -16,11 +16,12 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from pylons import request, g
+from pylons import request
+from pylons import app_globals as g
 from reddit_base import RedditController
 from r2.lib.pages import AdminPage, AdminAwards
 from r2.lib.pages import AdminAwardGive, AdminAwardWinners

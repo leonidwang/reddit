@@ -16,17 +16,15 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from copy import copy
-import datetime
 
-from pylons import g
+from pylons import app_globals as g
 
 from r2.lib.memoize import memoize
-from r2.lib.utils import storage
 
 LIVE_STATES = ['RUNNING', 'STARTING', 'WAITING', 'BOOTSTRAPPING']
 COMPLETED = 'COMPLETED'
@@ -34,132 +32,34 @@ PENDING = 'PENDING'
 NOTFOUND = 'NOTFOUND'
 
 
-@memoize('emr_describe_jobflows', time=30, timeout=60)
-def describe_jobflows_cached(emr_connection):
-    """Return a list of jobflows on this connection.
-
-    It's good to cache this information because hitting AWS too often can
-    result in rate limiting, and it's not particularly detrimental to have
-    slightly out of date information in most cases. Non-running jobflows and
-    information we don't need are discarded to reduce the size of cached data.
-
-    """
-
-    jobflows = emr_connection.describe_jobflows()
-
-    r_jobflows = []
-    for jf in jobflows:
-        # skip old not live jobflows
-        d = jf.steps[-1].creationdatetime.split('T')[0]
-        last_step_start = datetime.datetime.strptime(d, '%Y-%m-%d').date()
-        now = datetime.datetime.now().date()
-        if (jf.state not in LIVE_STATES and
-            now - last_step_start > datetime.timedelta(2)):
-            continue
-
-        # keep only fields we need
-        r_jf = storage(name=jf.name,
-                       jobflowid=jf.jobflowid,
-                       state=jf.state)
-        r_bootstrapactions = []
-        for i in jf.bootstrapactions:
-            s = storage(name=i.name,
-                        path=i.path,
-                        args=[a.value for a in i.args])
-            r_bootstrapactions.append(s)
-        r_jf['bootstrapactions'] = r_bootstrapactions
-        r_steps = []
-        for i in jf.steps:
-            s = storage(name=i.name,
-                        state=i.state,
-                        jar=i.jar,
-                        args=[a.value for a in i.args])
-            r_steps.append(s)
-        r_jf['steps'] = r_steps
-        r_instancegroups = []
-        for i in jf.instancegroups:
-            s = storage(name=i.name,
-                        instancegroupid=i.instancegroupid,
-                        instancerequestcount=i.instancerequestcount)
-            r_instancegroups.append(s)
-        r_jf['instancegroups'] = r_instancegroups
-        r_jobflows.append(r_jf)
-    return r_jobflows
+def get_live_clusters(emr_connection):
+    ret = emr_connection.list_clusters(cluster_states=LIVE_STATES)
+    return ret.clusters or []
 
 
-def update_jobflows_cached(emr_connection):
-    r = describe_jobflows_cached(emr_connection, _update=True)
+@memoize('get_step_states', time=60, timeout=60)
+def get_step_states(emr_connection, jobflowid):
+    """Return the names and states of all steps in the jobflow.
 
-
-def describe_jobflows_by_ids(emr_connection, jobflow_ids, _update=False):
-    g.reset_caches()
-    jobflows = describe_jobflows_cached(emr_connection, _update=_update)
-    return [jf for jf in jobflows if jf.jobflowid in jobflow_ids]
-
-
-def describe_jobflows_by_state(emr_connection, states, _update=False):
-    g.reset_caches()
-    jobflows = describe_jobflows_cached(emr_connection, _update=_update)
-    return [jf for jf in jobflows if jf.state in states]
-
-
-def describe_jobflows(emr_connection, _update=False):
-    g.reset_caches()
-    jobflows = describe_jobflows_cached(emr_connection, _update=_update)
-    return jobflows
-
-
-def describe_jobflow(emr_connection, jobflow_id, _update=False):
-    r = describe_jobflows_by_ids(emr_connection, [jobflow_id], _update=_update)
-    if r:
-        return r[0]
-
-
-def get_compatible_jobflows(emr_connection, bootstrap_actions=None,
-                            setup_steps=None):
-    """Return jobflows that have specified bootstrap actions and setup steps.
-
-    Assumes there are no conflicts with bootstrap actions or setup steps:
-    a jobflow is compatible if it contains at least the requested
-    bootstrap_actions and setup_steps (may contain additional).
+    Memoized to prevent ratelimiting.
 
     """
 
-    bootstrap_actions = bootstrap_actions or []
-    setup_steps = setup_steps or []
+    ret = emr_connection.list_steps(jobflowid)
+    steps = []
+    steps.extend(ret.steps)
+    while hasattr(ret, "marker"):
+        ret = emr_connection.list_steps(jobflowid, marker=ret.marker)
+        steps.extend(ret.steps)
 
-    # update list of running jobflows--ensure we don't pick a recently dead one
-    update_jobflows_cached(emr_connection)
-
-    jobflows = describe_jobflows_by_state(emr_connection, LIVE_STATES,
-                                          _update=True)
-    if not jobflows:
-        return []
-
-    required_bootstrap_actions = set((i.name, i.path, tuple(sorted(i.args())))
-                                     for i in bootstrap_actions)
-    required_setup_steps = set((i.name, i.jar(), tuple(sorted(i.args())))
-                               for i in setup_steps)
-
-    if not required_bootstrap_actions and not required_setup_steps:
-        return jobflows
-
-    running = []
-    for jf in jobflows:
-        extant_bootstrap_actions = set((i.name, i.path, tuple(sorted(i.args)))
-                                       for i in jf.bootstrapactions)
-        if not (required_bootstrap_actions <= extant_bootstrap_actions):
-            continue
-
-        extant_setup_steps = set((i.name, i.jar, tuple(sorted(i.args)))
-                                 for i in jf.steps)
-        if not (required_setup_steps <= extant_setup_steps):
-            continue
-        running.append(jf)
-    return running
+    ret = []
+    for step in steps:
+        start_str = step.status.timeline.creationdatetime
+        ret.append((step.name, step.status.state, start_str))
+    return ret
 
 
-def get_step_state(emr_connection, jobflowid, step_name):
+def get_step_state(emr_connection, jobflowid, step_name, update=False):
     """Return the state of a step.
 
     If jobflowid/step_name combination is not unique this will return the state
@@ -167,61 +67,63 @@ def get_step_state(emr_connection, jobflowid, step_name):
 
     """
 
-    jobflow = describe_jobflow(emr_connection, jobflowid)
-    if not jobflow:
-        return NOTFOUND
+    g.reset_caches()
+    steps = get_step_states(emr_connection, jobflowid, _update=update)
 
-    for step in reversed(jobflow.steps):
-        if step.name == step_name:
-            return step.state
+    for name, state, start in sorted(steps, key=lambda t: t[2], reverse=True):
+        if name == step_name:
+            return state
     else:
         return NOTFOUND
 
 
-def get_jobflow_by_name(emr_connection, jobflow_name):
-    """Return the most recent jobflow with specified name."""
-    jobflows = describe_jobflows_by_state(emr_connection, LIVE_STATES,
-                                          _update=True)
-    for jobflow in jobflows:
-        if jobflow.name == jobflow_name:
-            return jobflow
-    else:
-        return None
+def get_jobflow_id(emr_connection, name):
+    """Return id of the live cluster with specified name."""
+    ret = emr_connection.list_clusters(cluster_states=LIVE_STATES)
+    clusters = ret.clusters
+
+    try:
+        # clusters appear to be ordered by creation time
+        return [cluster.id for cluster in clusters if cluster.name == name][0]
+    except IndexError:
+        return
 
 
 def terminate_jobflow(emr_connection, jobflow_name):
-    jobflow = get_jobflow_by_name(emr_connection, jobflow_name)
-    if jobflow:
-        emr_connection.terminate_jobflow(jobflow.jobflowid)
+    jobflow_id = get_jobflow_id(emr_connection, jobflow_name)
+    if jobflow_id:
+        emr_connection.terminate_jobflow(jobflow_id)
 
 
 def modify_slave_count(emr_connection, jobflow_name, num_slaves=1):
-    jobflow = get_jobflow_by_name(emr_connection, jobflow_name)
-    if not jobflow:
+    jobflow_id = get_jobflow_id(emr_connection, jobflow_name)
+    if not jobflow_id:
         return
 
-    slave_instancegroupid = None
-    slave_instancerequestcount = 0
-    for instance in jobflow.instancegroups:
-        if instance.name == 'slave':
-            slave_instancegroupid = instance.instancegroupid
-            slave_instancerequestcount = instance.instancerequestcount
-            break
+    ret = emr_connection.list_instance_groups(jobflow_id)
 
-    if slave_instancegroupid and slave_instancerequestcount != num_slaves:
-        print ('Modifying slave instance count of %s (%s -> %s)' %
-               (jobflow_name, slave_instancerequestcount, num_slaves))
-        emr_connection.modify_instance_groups(slave_instancegroupid,
-                                              num_slaves)
+    try:
+        instancegroup = [i for i in ret.instancegroups if i.name == "slave"][0]
+    except IndexError:
+        # no slave instance group
+        return
+
+    if instancegroup.requestedinstancecount != num_slaves:
+        return
+
+    msg = 'Modifying slave instance count of %s (%s -> %s)'
+    print msg % (jobflow_name, instancegroup.requestedinstancecount, num_slaves)
+    emr_connection.modify_instance_groups(instancegroup.id, num_slaves)
 
 
 class EmrJob(object):
     def __init__(self, emr_connection, name, steps=[], setup_steps=[],
                  bootstrap_actions=[], log_uri=None, keep_alive=True,
-                 ec2_keyname=None, hadoop_version='0.20.205',
+                 ec2_keyname=None, hadoop_version='1.0.3',
                  ami_version='latest', master_instance_type='m1.small',
                  slave_instance_type='m1.small', num_slaves=1,
-                 visible_to_all_users=True):
+                 visible_to_all_users=True, job_flow_role=None,
+                 service_role=None, tags=None):
 
         self.jobflowid = None
         self.conn = emr_connection
@@ -239,6 +141,9 @@ class EmrJob(object):
         self.slave_instance_type = slave_instance_type
         self.num_instances = num_slaves + 1
         self.visible_to_all_users = visible_to_all_users
+        self.job_flow_role = job_flow_role
+        self.service_role = service_role
+        self.tags = tags or {}
 
     def run(self):
         steps = copy(self.setup_steps)
@@ -253,17 +158,16 @@ class EmrJob(object):
             num_instances=self.num_instances,
             enable_debugging=self.enable_debugging,
             log_uri=self.log_uri,
-            visible_to_all_users=self.visible_to_all_users)
+            visible_to_all_users=self.visible_to_all_users,
+            job_flow_role=self.job_flow_role, service_role=self.service_role)
 
         self.jobflowid = self.conn.run_jobflow(**job_flow_args)
-        return
-
-    @property
-    def jobflow_state(self):
-        if self.jobflowid:
-            return describe_jobflow(self.conn, self.jobflowid).state
-        else:
-            return NOTFOUND
+        if self.tags:
+            assert isinstance(self.tags, dict)
+            # The EMR Cluster name is distinct from the Name tag. The latter
+            # is exportable as a cost allocation tag.
+            self.tags["Name"] = self.name
+            self.conn.add_tags(self.jobflowid, self.tags)
 
     def terminate(self):
         terminate_jobflow(self.conn, self.name)

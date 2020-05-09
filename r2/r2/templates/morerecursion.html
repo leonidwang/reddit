@@ -16,26 +16,28 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
 <%inherit file="comment_skeleton.html"/>
+<%!
+    from r2.models import Link
+%>
 
-<%def name="collapsed()">
-</%def>
 
 <%def name="commentBody()">
-<span class="deepthread"><a href="${thing.parent_permalink}">${_("continue this thread")}</a></span>
-</%def>
-
-<%def name="arrows()">
-</%def>
-
-<%def name="buttons()">
-</%def>
-
-<%def name="tagline(collapse=False)">
+<%
+  url = thing.parent_permalink
+  inbound_tracking_url = Link.tracking_link(thing.parent_permalink, thing, context='continue_thread')
+%>
+<span class="deepthread"><a
+    href="${url}"
+    %if inbound_tracking_url != url:
+      data-href-url="${url}"
+      data-inbound-url="${inbound_tracking_url}"
+    %endif
+    >${_("continue this thread")}</a></span>
 </%def>
 
 <%def name="midcol(cls='')">

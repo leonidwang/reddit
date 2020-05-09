@@ -16,34 +16,20 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from r2.models import *
-from r2.lib.normalized_hot import get_hot
+from r2.lib.normalized_hot import normalized_hot
 from r2.lib import count
 from r2.lib.utils import UniqueIterator, timeago
-
-from pylons import c
 
 import random
 from time import time
 
 organic_max_length= 50
 
-def keep_fresh_links(item):
-    if c.user_is_loggedin and c.user._id == item.author_id:
-        return True
-
-    if item._spam or item._deleted:
-        return False
-
-    from r2.lib.promote import is_promo
-    if is_promo(item):
-        return (not item.over_18 or c.over18) and not item.hidden
-
-    return item.fresh
 
 def cached_organic_links(*sr_ids):
     sr_count = count.get_link_counts()
@@ -59,8 +45,8 @@ def cached_organic_links(*sr_ids):
 
     #potentially add an up and coming link
     if random.choice((True, False)) and sr_ids:
-        sr = Subreddit._byID(random.choice(sr_ids))
-        fnames = get_hot([sr])
+        sr_id = random.choice(sr_ids)
+        fnames = normalized_hot([sr_id])
         if fnames:
             if len(fnames) == 1:
                 new_item = fnames[0]

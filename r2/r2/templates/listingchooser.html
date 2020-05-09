@@ -16,17 +16,15 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2012
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
+<%namespace file="utils.html" import="classes"/>
+
 <%def name="section_items(itemlist)">
   %for item in itemlist:
-    <li
-      %if item['selected']:
-        class="selected"
-      %endif
-      >
+    <li ${classes(item['extra_class'], 'selected' if item['selected'] else None)}>
       <a href="${item['path']}">
         ${item['name']}
         %if 'description' in item:
@@ -37,7 +35,6 @@
   %endfor
 </%def>
 
-<script>r.ui.collapseListingChooser()</script>
 <div class="listing-chooser">
   <div class="grippy"></div>
   <div class="contents">
@@ -53,6 +50,7 @@
         <ul class="multis">
           ${section_items(thing.sections['sample'])}
         </ul>
+        <p>${_('to hide these samples, create a multi of your own:')}</p>
       </div>
     %endif
     <ul class="multis">

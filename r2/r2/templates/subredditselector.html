@@ -8,7 +8,9 @@
 <div id="sr-autocomplete-area">
   <input id="sr-autocomplete" name="sr" type="text"
          autocomplete="off"
-         onkeyup="sr_name_up(event)"
+         %if thing.include_searches:
+           onkeyup="sr_name_up(event)"
+         %endif
          onkeydown="return sr_name_down(event)"
          onblur="hide_sr_name_list()"
          % if thing.default_sr:
@@ -17,7 +19,16 @@
          % if thing.required:
          required
          % endif
+         % if thing.class_name:
+          class="${thing.class_name}"
+         % endif
+         % if thing.placeholder:
+          placeholder="${thing.placeholder}"
+         % endif
          />
+  % if thing.show_add:
+    <button class="add">${_("add")}</button>
+  % endif
   <ul id="sr-drop-down">
     <li class="sr-name-row"
         onmouseover="highlight_reddit(this)"
@@ -26,7 +37,7 @@
   </ul>
 </div>
 <script type="text/javascript">
-  reddit.sr_cache = ${unsafe(thing.sr_searches)};
+  r.config.sr_cache = ${unsafe(thing.sr_searches)};
 </script>
 ${error_field("SUBREDDIT_NOEXIST", "sr", "div")}
 ${error_field("SUBREDDIT_NOTALLOWED", "sr", "div")}

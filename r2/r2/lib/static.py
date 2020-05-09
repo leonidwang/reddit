@@ -17,7 +17,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -30,7 +30,7 @@ import shutil
 
 
 def locate_static_file(name):
-    from pylons import g
+    from pylons import app_globals as g
     static_dirs = [plugin.static_dir for plugin in g.plugins]
     static_dirs.insert(0, g.paths['static_files'])
 

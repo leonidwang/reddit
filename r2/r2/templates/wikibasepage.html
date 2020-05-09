@@ -16,9 +16,13 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
+<%!
+    from r2.config import feature
+%>
+
 <%namespace file="less.html" import="less_stylesheet"/>
 <%inherit file="reddit.html"/>
 
@@ -38,6 +42,11 @@
             href="${thing.base_url}/${action[0]}/${thing.page}"
         %else:
             href="${thing.base_url}/${action[0]}"
+        %endif
+        data-type="subreddit"
+        %if action[3]:
+            data-event-action="pageview"
+            data-event-detail="${action[3]}"
         %endif
         >${action[1]}</a>
     %endfor
@@ -62,7 +71,7 @@
         %endif
     </span>
         
-    <div class="wiki-page-content">
+    <div class="wiki-page-content md-container">
         %if thing.description:
             <div class="description">
                 <h2>

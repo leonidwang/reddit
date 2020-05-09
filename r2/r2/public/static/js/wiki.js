@@ -24,8 +24,9 @@ r.wiki = {
     },
 
     init: function() {
-        $('body').delegate('.wiki-page .revision_hide', 'click', this.toggleHide)
-        $('body').delegate('.wiki-page .toggle-source', 'click', this.toggleSource)
+        $('body.wiki-page').on('click', '.revision_hide', this.toggleHide)
+        $('body.wiki-page').on('click', '.revision_delete', this.toggleDelete)
+        $('body.wiki-page').on('click', '.toggle-source', this.toggleSource)
     },
 
     toggleSource: function(event) {
@@ -33,8 +34,41 @@ r.wiki = {
         $('.wiki-page .source').toggle('slow')
     },
 
+    toggleDelete: function(event) {
+        event.preventDefault()
+        var $this = $(this),
+            url = r.wiki.baseApiUrl() + '/delete',
+            $this_parent = $this.parents('.revision'),
+            deleted = $this_parent.hasClass('deleted')
+        $this_parent.toggleClass('deleted')
+        r.wiki.request({
+            url: url,
+            type: 'POST',
+            dataType: 'json',
+            data: {
+                revision: $this.data('revision'),
+                deleted: !deleted
+            },
+            error: function() {
+                $this_parent.toggleClass('deleted')
+            },
+            success: function(data) {
+                if (!data.status) {
+                    $this_parent.removeClass('deleted')
+                } else {
+                    $this_parent.addClass('deleted')
+                }
+            }
+        })
+    },
+
     toggleHide: function(event) {
         event.preventDefault()
+
+        if (r.access.isLinkRestricted(this)) {
+            return;
+        }
+
         var $this = $(this),
             url = r.wiki.baseApiUrl() + '/hide',
             $this_parent = $this.parents('.revision')
@@ -119,7 +153,7 @@ r.wiki = {
                         ,specials = special.children('#specials')
                     specials.empty()
                     for(i in errors) {
-                        specials.append($('<p>').text(errors[i]))
+                        specials.append($('<pre>').text($.unsafe(errors[i])))
                     }
                     special.fadeIn('slow')
                 },

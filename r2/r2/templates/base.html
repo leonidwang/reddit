@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -26,14 +26,17 @@
    from r2.models import Link, Comment, Subreddit
    from r2.lib import tracking
 %>
-<%namespace file="utils.html" import="js_setup, googleanalytics, classes"/>
-<html xmlns="http://www.w3.org/1999/xhtml" lang="${c.lang}" 
-      xml:lang="${c.lang}" ${c.lang_rtl and unsafe('dir="rtl"') or ''}>
+<%namespace file="utils.html" import="js_setup, googleanalytics, googletagmanager, classes"/>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="${c.lang}"
+      xml:lang="${c.lang}">
   <head>
     <title>${self.Title()}</title>
     <meta name="keywords" content="${self.keywords()}" />
     <meta name="description" content="${getattr(thing, 'short_description', None) or g.short_description}" />
+    <meta name="referrer" content="${c.referrer_policy}">
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <link type="application/opensearchdescription+xml" rel="search" href="/static/opensearch.xml"/>
+    <link rel="canonical" href="${thing.canonical_link}" />
     ${self.viewport()}
     ${self.robots()}
     ${self.pagemeta()}
@@ -42,17 +45,18 @@
     ${js_setup(getattr(thing, "extra_js_config", None))}
 
     ##things here may depend on globals, or included js, so we run them last
-    <script type="text/javascript">
-      ${self.javascript_run()}
-    </script>
     <style type="text/css">
-      ${unsafe(_("/* Custom css: use this block to insert special translation-dependent css in the page header */"))}
+      ## <style>s are treated as RAWTEXT segments, so we can't `websafe()` their contents.
+      ## According to the HTML spec's RAWTEXT parsing rules, this should work for escaping.
+      ## http://www.w3.org/TR/html5/syntax.html#rawtext-less-than-sign-state
+      ${unsafe(_("/* Custom css: use this block to insert special translation-dependent css in the page header */").replace("</", ""))}
     </style>
 
     ${self.head()}
   </head>
 
   <body ${classes(*thing.page_classes())}>
+    ${googletagmanager()}
     ${self.bodyContent()}
     ${self.javascript_bottom()}
   </body>
@@ -79,23 +83,8 @@ reddit, reddit.com, vote, comment, submit
    %endif
 </%def>
 
-<%def name="javascript_run()">
-</%def>
-
 <%def name="head()">
-%if g.tracker_url and thing.site_tracking and not c.secure:
-<script type="text/javascript">
-    (function() {
-        var url = '${tracking.get_pageview_pixel_url()}';
-        var cachebuster = Math.round(Math.random() * 2147483647);
-        var cachebusted_url = url + "&r=" + cachebuster;
-        var img = new Image();
-        img.src = cachebusted_url;
-    })();
-</script>
-%endif
-
-${googleanalytics('web')}
+${googleanalytics('web', thing.is_gold_page() if hasattr(thing, 'is_gold_page') else False)}
 </%def>
 
 <%def name="pagemeta()">

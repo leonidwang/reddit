@@ -16,20 +16,11 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
-<%!
-  from r2.lib.template_helpers import static
-  from r2.lib import js
-%>
 <%namespace file="utils.html" import="error_field"/>
-
-${unsafe(js.use('sponsored'))}
-<script type="text/javascript">
-  $(function() { update_bid("#bid-field"); }); 
-</script>
 
 <div class="payment-setup">
   <h1>${_("set up payment for this link")}</h1>
@@ -37,17 +28,13 @@ ${unsafe(js.use('sponsored'))}
         class="pretty-form"
         onsubmit="return post_form(this, 'update_pay')">
     <p>
-      The duration of this link is ${thing.campaign.duration} 
-      (from ${thing.campaign.start_date} to ${thing.campaign.end_date}).
+      ${_("The duration of this link is %(duration)s (from %(start)s to %(end)s).") % dict(duration=thing.duration, start=thing.start_date, end=thing.end_date)}
     </p>
     <p id="bid-field">
-      <input type="hidden" name="campaign" value="${thing.campaign.campaign_id36}" />
+      <input type="hidden" name="campaign" value="${thing.campaign_id36}" />
       <input type="hidden" name="link" value="${thing.link._fullname}" />
-      ${unsafe(_("Your current bid is $%(bid)s") % dict(bid=thing.campaign.bid))}
-      ${error_field("BAD_BID", "bid")}
-    <span class="gray">
-      &#32;${_('(total for the duration provided)')}
-    </span>
+      ${_("Your current budget is %(budget)s") % dict(budget=thing.budget)}
+      ${error_field("OVERSOLD_DETAIL", "bid", "div")}
   </p>
   %if thing.profiles:
   <p>
@@ -72,7 +59,8 @@ ${unsafe(js.use('sponsored'))}
     </p>
   %endif
   <p class="info">
-   ${_("NOTE: your card will not be charged until the link has been queued for promotion.")}
+   ${_("NOTE: your card will not be charged until the campaign has been queued "
+       "for promotion.")}
   </p>
     <input type="hidden" name="customer_id" value="${thing.customer_id}" />
     
@@ -83,18 +71,15 @@ ${unsafe(js.use('sponsored'))}
   </form>
   
   <script type="text/javascript">
-    function cancel_enable_all(elem) {
-      
-    }
     function enable_all(elem) {
-       $(elem).parents("div.pay-form").andSelf()
+       $(elem).parents("div.pay-form").addBack()
              .find("[disabled]").removeAttr("disabled").end()
              .find("table").removeClass("disabled").end()
              .find("[name=edit]").val("on");
        return false;
     }
     function disable_all(elem) {
-       var what = $(elem).parents("div.pay-form").andSelf()
+       var what = $(elem).parents("div.pay-form").addBack()
                      .find("table").addClass("disabled")
                      .find(":input").not("button")
                      .attr("disabled", "disabled");
@@ -109,7 +94,15 @@ ${unsafe(js.use('sponsored'))}
        if (val == "" || inputs.find("[name=edit]").val() == "on") 
             enable_all(inputs);
     }
-    
+
+    (function($) {
+      $.payment_redirect = function(url, isNewCard, amount) {
+        r.analytics.fireFunnelEvent('ads', isNewCard ? 'checkout-new' : 'checkout-existing');
+        r.analytics.fireFunnelEvent('ads', 'checkout-pay', {value: amount}, function() {
+          window.location.href = url;
+        });
+      };
+    })(window.jQuery);
   </script>
 </div>
 
@@ -155,18 +148,19 @@ ${unsafe(js.use('sponsored'))}
              ${getattr(data, field, '')}
            </textarea>
          %elif field == "country":
-           ## TODO: pycountry does country name i18n
-           <select name="${field}" ${disabled}>
-             %for code, country_name in g.countries.iteritems():
-               % if country_name in g.allowed_pay_countries:
-                 <option value="${code}"
-                       %if getattr(data, field, 'United States') == country_name:
-                         selected="selected"
-                       %endif
-                         >${country_name}</option>
-               % endif
-             %endfor
-           </select>
+           <%
+            selected_country = getattr(data, field, thing.default_country)
+            selected_insensitive = selected_country.lower()
+           %>
+           %if any(map(lambda country: country.lower() == selected_insensitive, thing.countries)):
+            <select ${disabled} id="input-${field}-${prof_id}" name="${field}">
+              %for country in thing.countries:
+                <option ${"selected" if selected_insensitive == country.lower() else ""}>${country}</option>
+              %endfor
+            </select>
+           %else:
+            <input type="text" ${disabled} id="input-${field}-${prof_id}" name="${field}" value="${selected_country}">
+           %endif
          %else:
            <input ${disabled}
                   id="input-${field}-${prof_id}" type="text" name="${field}" 

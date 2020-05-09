@@ -16,11 +16,11 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from pylons import c
+from pylons import tmpl_context as c
 
 def api_type(subtype = ''):
     return 'api-' + subtype if subtype else 'api'
@@ -33,10 +33,9 @@ def get_api_subtype():
         return c.render_style[4:]
 
 extension_mapping = {
-    "rss": ("xml", "text/xml; charset=UTF-8"),
-    "xml": ("xml", "text/xml; charset=UTF-8"),
+    "rss": ("xml", "application/atom+xml; charset=UTF-8"),
+    "xml": ("xml", "application/atom+xml; charset=UTF-8"),
     "js": ("js", "text/javascript; charset=UTF-8"),
-    "wired": ("wired", "text/javascript; charset=UTF-8"),
     "embed": ("htmllite", "text/javascript; charset=UTF-8"),
     "mobile": ("mobile", "text/html; charset=UTF-8"),
     "png": ("png", "image/png"),
@@ -51,6 +50,7 @@ extension_mapping = {
 }
 
 API_TYPES = ('api', 'json')
+RSS_TYPES = ('rss', 'xml')
 
 def set_extension(environ, ext):
     environ["extension"] = ext

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -24,19 +24,25 @@ import json
 import inspect
 import pytz
 from datetime import datetime
-from socket import gethostbyaddr
 
-from pylons import g
+from pylons import app_globals as g
 
 from pycassa import ColumnFamily
 from pycassa.pool import MaximumRetryException
 from pycassa.cassandra.ttypes import ConsistencyLevel, NotFoundException
-from pycassa.system_manager import (SystemManager, UTF8_TYPE,
-                                    COUNTER_COLUMN_TYPE, TIME_UUID_TYPE,
-                                    ASCII_TYPE)
-from pycassa.types import DateType, LongType, IntegerType
+from pycassa.system_manager import (
+    ASCII_TYPE,
+    COUNTER_COLUMN_TYPE,
+    DATE_TYPE,
+    INT_TYPE,
+    SystemManager,
+    TIME_UUID_TYPE,
+    UTF8_TYPE,
+)
+from pycassa.types import DateType
+from pycassa.util import convert_uuid_to_time
 from r2.lib.utils import tup, Storage
-from r2.lib import cache
+from r2.lib.sgm import sgm
 from uuid import uuid1, UUID
 from itertools import chain
 import cPickle as pickle
@@ -47,7 +53,6 @@ connection_pools = g.cassandra_pools
 default_connection_pool = g.cassandra_default_pool
 
 keyspace = 'reddit'
-thing_cache = g.thing_cache
 disallow_db_writes = g.disallow_db_writes
 tz = g.tz
 log = g.log
@@ -184,35 +189,6 @@ class ThingMeta(type):
     def __repr__(cls):
         return '<thing: %s>' % cls.__name__
 
-class Counter(object):
-    __metaclass__ = ThingMeta
-
-    _use_db = False
-    _connection_pool = 'main'
-    _extra_schema_creation_args = {
-        'default_validation_class': COUNTER_COLUMN_TYPE,
-        'replicate_on_write': True
-    }
-
-    _type_prefix = None
-    _cf_name = None
-    _compare_with = UTF8_TYPE
-
-    @classmethod
-    def _byID(cls, key):
-        return cls._cf.get(key)
-
-    @classmethod
-    @will_write
-    def _incr(cls, key, column, delta=1, super_column=None):
-        cls._cf.add(key, column, delta, super_column)
-
-    @classmethod
-    @will_write
-    def _incr_multi(cls, key, data):
-        with cls._cf.batch() as b:
-            b.insert(key, data)
-
 
 class ThingBase(object):
     # base class for Thing
@@ -235,12 +211,13 @@ class ThingBase(object):
 
     _value_type = None # if set, overrides all of the _props types
                        # below. Used for Views. One of 'int', 'float',
-                       # 'bool', 'pickle', 'date', 'bytes', 'str'
+                       # 'bool', 'pickle', 'json', 'date', 'bytes', 'str'
 
     _int_props = ()
     _float_props = () # note that we can lose resolution on these
     _bool_props = ()
     _pickle_props = ()
+    _json_props = ()
     _date_props = () # note that we can lose resolution on these
     _bytes_props = ()
     _str_props = () # at present we never actually read out of here
@@ -291,6 +268,9 @@ class ThingBase(object):
     # value is true, we will make sure to do extra gets to retrieve all of
     # the columns in a row when there are more than the per-call maximum.
     _fetch_all_columns = False
+
+    # request-local cache to avoid duplicate lookups from hitting C*
+    _local_cache = g.cassandra_local_cache
 
     def __init__(self, _id = None, _committed = False, _partial = None, **kw):
         # things that have changed
@@ -389,8 +369,13 @@ class ThingBase(object):
 
             return l_ret
 
-        ret = cache.sgm(thing_cache, ids, lookup, prefix=cls._cache_prefix(),
-                        found_fn=reject_bad_partials)
+        ret = sgm(
+            cache=cls._local_cache,
+            keys=ids,
+            miss_fn=lookup,
+            prefix=cls._cache_prefix(),
+            found_fn=reject_bad_partials,
+        )
 
         if is_single and not ret:
             raise NotFound("<%s %r>" % (cls.__name__,
@@ -429,7 +414,10 @@ class ThingBase(object):
             items.extend(typ._byID(ids).values())
 
         if is_single:
-            return items[0]
+            try:
+                return items[0]
+            except IndexError:
+                raise NotFound("<%s %r>" % (cls.__name__, ids[0]))
         elif return_dict:
             return dict((x._fullname, x) for x in items)
         else:
@@ -484,6 +472,8 @@ class ThingBase(object):
             return val == '1'
         elif attr in cls._pickle_props or (cls._value_type and cls._value_type == 'pickle'):
             return pickle.loads(val)
+        elif attr in cls._json_props or (cls._value_type and cls._value_type == 'json'):
+            return json.loads(val)
         elif attr in cls._date_props or attr == cls._timestamp_prop or (cls._value_type and cls._value_type == 'date'):
             return cls._deserialize_date(val)
         elif attr in cls._bytes_props or (cls._value_type and cls._value_type == 'bytes'):
@@ -503,10 +493,13 @@ class ThingBase(object):
             return '1' if val else '0'
         elif attr in cls._pickle_props or (cls._value_type and cls._value_type == 'pickle'):
             return pickle.dumps(val)
+        elif attr in cls._json_props or (cls._value_type and cls._value_type == 'json'):
+            return json.dumps(val)
         elif (attr in cls._date_props or attr == cls._timestamp_prop or
               (cls._value_type and cls._value_type == 'date')):
             # the _timestamp_prop is handled in _commit(), not here
-            if cls._get_column_validator(attr) == 'DateType':
+            validator = cls._get_column_validator(attr)
+            if validator in ("DateType", "TimeUUIDType"):
                 # pycassa will take it from here
                 return val
             else:
@@ -524,6 +517,8 @@ class ThingBase(object):
     def _deserialize_date(cls, val):
         if isinstance(val, datetime):
             date = val
+        elif isinstance(val, UUID):
+            return convert_uuid_to_time(val)
         elif len(val) == 8: # cassandra uses 8-byte integer format for this
             date = date_serializer.unpack(val)
         else: # it's probably the old-style stringified seconds since epoch
@@ -637,7 +632,7 @@ class ThingBase(object):
 
         self._committed = True
 
-        thing_cache.set(self._cache_key(), self)
+        self.__class__._local_cache.set(self._cache_key(), self)
 
     def _revert(self):
         if not self._committed:
@@ -870,6 +865,7 @@ class DenormalizedRelation(object):
     _write_last_modified = True
     _extra_schema_creation_args = dict(key_validation_class=ASCII_TYPE,
                                        default_validation_class=UTF8_TYPE)
+    _ttl = None
 
     @classmethod
     def value_for(cls, thing1, thing2, **kw):
@@ -877,6 +873,7 @@ class DenormalizedRelation(object):
         raise NotImplementedError()
 
     @classmethod
+    @will_write
     def create(cls, thing1, thing2s, **kw):
         """Create a relationship between thing1 and thing2s.
 
@@ -890,7 +887,7 @@ class DenormalizedRelation(object):
         thing2s = tup(thing2s)
         values = {thing2._id36 : cls.value_for(thing1, thing2, **kw)
                   for thing2 in thing2s}
-        cls._cf.insert(thing1._id36, values)
+        cls._cf.insert(thing1._id36, values, ttl=cls._ttl)
 
         for view in cls._views:
             view.create(thing1, thing2s, **kw)
@@ -900,6 +897,7 @@ class DenormalizedRelation(object):
             LastModified.touch(thing1._fullname, cls._last_modified_name)
 
     @classmethod
+    @will_write
     def destroy(cls, thing1, thing2s):
         """Destroy relationships between thing1 and some thing2s."""
         thing2s = tup(thing2s)
@@ -1061,7 +1059,15 @@ class ColumnQuery(object):
                 try:
                     del columns[column_start]
                 except KeyError:
-                    columns.popitem(last=True)  # remove extra column
+                    # This can happen when a timezone-aware datetime is
+                    # passed in as a column_start, but non-timezone-aware
+                    # datetimes are returned from cassandra, causing `del` to
+                    # fail.
+                    #
+                    # Reversed queries include column_start in the results,
+                    # while non-reversed queries do not.
+                    if self.column_reversed:
+                        columns.popitem(last=False)
 
             if not columns:
                 return
@@ -1183,34 +1189,6 @@ class Query(object):
             for col, val in row._t.iteritems():
                 print '\t%s: %r' % (col, val)
 
-    @will_write
-    def _delete_all(self, write_consistency_level = None):
-        # uncomment to use on purpose
-        raise InvariantException("Nice try, FBI")
-
-        # TODO: this could use cf.truncate instead and be *way*
-        # faster, but it wouldn't flush the thing_cache at the same
-        # time that way
-
-        q = self.copy()
-        q.after = q.limit = None
-
-        # since we're just deleting it, we only need enough columns to
-        # avoid reading ghost rows
-        q.max_column_count = 1
-
-        # I'm going to guess that if they are trying to flush out an
-        # entire CF, they aren't that worried about how long it takes
-        # to become consistent. So we'll default to the fastest way
-        wcl = q.cls._wcl(write_consistency_level, CL.ONE)
-
-        for row in q:
-            print row
-
-            # n.b. we're not calling _on_destroy!
-            q.cls._cf.remove(row._id, write_consistency_level = wcl)
-            thing_cache.delete(q.cls._cache_key_id(row._id))
-
     def __iter__(self):
         # n.b.: we aren't caching objects that we find this way in the
         # LocalCache. This may will need to be changed if we ever
@@ -1315,6 +1293,7 @@ class View(ThingBase):
     @will_write
     def _set_values(cls, row_key, col_values,
                     write_consistency_level = None,
+                    batch=None,
                     ttl=None):
         """Set a set of column values in a row of a view without
            looking up the whole row first"""
@@ -1330,21 +1309,26 @@ class View(ThingBase):
         # there is a default set on either the row or the column
         default_ttl = ttl or cls._ttl
 
-        with cls._cf.batch(write_consistency_level = cls._wcl(write_consistency_level)) as b:
-            # with some quick tweaks we could have a version that
-            # operates across multiple row keys, but this is not it
+        def do_inserts(b):
             for k, v in updates.iteritems():
                 b.insert(row_key, {k: v},
                          ttl=cls._default_ttls.get(k, default_ttl))
 
+        if batch is None:
+            batch = cls._cf.batch(write_consistency_level = cls._wcl(write_consistency_level))
+            with batch as b:
+                do_inserts(b)
+        else:
+            do_inserts(batch)
+
         # can we be smarter here?
-        thing_cache.delete(cls._cache_key_id(row_key))
+        cls._local_cache.delete(cls._cache_key_id(row_key))
 
     @classmethod
     @will_write
     def _remove(cls, key, columns):
         cls._cf.remove(key, columns)
-        thing_cache.delete(cls._cache_key_id(key))
+        cls._local_cache.delete(cls._cache_key_id(key))
 
 class DenormalizedView(View):
     """Store the entire underlying object inside the View column."""
@@ -1409,57 +1393,3 @@ class DenormalizedView(View):
             return objs[0]
         else:
             return objs
-
-def schema_report():
-    manager = get_manager()
-    print manager.describe_keyspace(keyspace)
-
-def ring_report():
-    # uses a silly algorithm to pick natural endpoints that requires N>=RF+1
-
-    sizes = {}
-    nodes = {} # token -> node
-
-    manager = get_manager()
-
-    ring = manager.describe_ring(keyspace)
-    ring.sort(key=lambda tr: long(tr.start_token))
-
-    for x, tr in enumerate(ring):
-        next = ring[x+1] if x < len(ring)-1 else ring[0]
-
-        # tr = ring1[x]
-        # next = ring1[x+1]
-
-        s = long(tr.start_token)
-        e = long(tr.end_token)
-
-        if e > s:
-            # a regular range
-            l = e-s
-        else:
-            # range that overlaps 0
-            l = e+2**127-s
-
-        for ep in tr.endpoints:
-            sizes.setdefault(ep, []).append(float(l)/2**127)
-
-        natural = set(tr.endpoints) - set(next.endpoints)
-        assert len(natural) == 1
-        natural = natural.pop()
-
-        nodes[e] = natural
-
-    totalsize = sum(map(sum, sizes.values()))
-    for token, ip in sorted(nodes.items(),
-                              key = lambda x: x[0]):
-        size = sizes[ip]
-        name = gethostbyaddr(ip)[0]
-
-        fmt_perc = lambda num: '%s%2.2f%%' % (' ' if num < 10 else '',
-                                              num)
-        maxtoklen = len(str(2**127))
-
-        print '%16s\t%s\t%s\t%s' % (ip, name,
-                                    fmt_perc(sum(size)/totalsize * 100),
-                                    str(token).rjust(maxtoklen))

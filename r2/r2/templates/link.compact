@@ -16,20 +16,21 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
 <%!
+   from r2.config import feature
    from r2.lib.template_helpers import add_sr
-   from r2.lib.template_helpers import s3_https_if_secure
+   from r2.lib.template_helpers import make_url_protocol_relative
    import urllib
    from r2.lib.filters import _force_unicode, _force_utf8
  %>
 <%namespace file="printable.compact" import="delete_report_buttons"/>
 <%namespace file="printable.html" import="arrow, score"/>
-<%namespace file="link.html" import="tagline"/>
-<%namespace file="utils.html" import="plain_link" />
+<%namespace file="link.html" import="tagline, thumbnail"/>
+<%namespace file="utils.html" import="plain_link, nsfw_stamp, quarantine_stamp" />
 <%namespace file="utils.compact" import="icon_button, toggle_button" />
 <%namespace file="printablebuttons.html" import="state_button" />
 
@@ -41,14 +42,12 @@
 
 <%
     div_class = "thing link id-%s" % thing._fullname
-    if thing.stickied:
+    if thing.use_sticky_style:
         div_class += " stickied"
 %>
 <div class="${div_class}">
-  <span class="rank" style="width:${thing.numcolmargin};">
-    %if thing.num > 0:
-      ${thing.num}
-    %endif
+  <span class="rank">
+    ${thing.num_text}
   </span>
   <% 
      like_cls = "unvoted"
@@ -70,21 +69,15 @@
   <%
     if thing.is_self:
         url = add_sr(thing.href_url)
-    elif thing.pref_frame:
-        url = thing.tblink + '.compact'
     else:
         url = thing.url
   %>
   %if c.site.link_flair_position == 'left' and thing.flair_text:
     ${flair()}
   %endif
-  %if thing.has_thumbnail and thing.thumbnail:
-    <a href="${url}" class="thumbnail">
-      <img src="${s3_https_if_secure(thing.thumbnail)}" alt=""/>
-     </a>
-  %endif
+    ${thumbnail()}
     <p class="title">
-    <a href="${url}">${thing.title}</a>
+    <a href="${url}" class="may-blank">${thing.title}</a>
     %if c.site.link_flair_position == 'right' and thing.flair_text:
       ${flair()}
     %endif
@@ -92,14 +85,17 @@
     %if thing.is_self:
         (self)
     %else:
-        (<a href="${thing.domain_path}">${thing.domain}</a>)
+        (<a href="${thing.domain_path}.compact">${thing.domain_str}</a>)
     %endif
     </span>
+    %if thing.quarantine:
+      <span class="quarantine-warning">
+        ${quarantine_stamp()}
+      </span>
+    %endif
     %if thing.nsfw:
       <span class="nsfw-warning">
-        <acronym title="${_('Adult content: Not Safe For Work')}">
-          ${_("NSFW")}
-        </acronym>
+        ${nsfw_stamp()}
       </span>
     %endif
     </p>
@@ -121,13 +117,13 @@
      %>
   <div class="expando" ${"style='display: none'" if not expand else ""}>
     %if thing.link_child:
-      ${thing.link_child.content()}
+      ${unsafe(thing.link_child.content())}
     %endif
   </div>
   <div class="clear options_expando hidden">
     <% 
        subject = "[reddit] I wanted to share this link with you"
-       body = """%(user)s shared a link with you from reddit (http://www.reddit.com/):
+       body = """%(user)s shared a link with you from reddit (https://www.reddit.com/):
 
 %(link)s
 
@@ -140,7 +136,7 @@ there's also a discussion going on here:
        link = _force_unicode(thing.url),
        title = _force_unicode(thing.title),
        permalink = add_sr(thing.permalink, sr_path = False, force_hostname = True, retain_extension=False))
-       url = "http://reddit.com/%s" % thing._id36
+       url = "https://reddit.com/%s" % thing._id36
        title = _force_unicode(thing.title)
        tweet = "%s %s" % (title[0:(139-len(url))], url)
        %>

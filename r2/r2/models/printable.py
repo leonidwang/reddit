@@ -16,11 +16,13 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from pylons import c, request
+from pylons import request
+from pylons import tmpl_context as c
+
 from r2.lib.strings import Score
 from r2.lib import hooks
 
@@ -31,7 +33,7 @@ class Printable(object):
     is_special = False
     can_ban = False
     deleted = False
-    rowstyle = ''
+    rowstyle_cls = ''
     collapsed = False
     author = None
     margin = 0
@@ -47,7 +49,16 @@ class Printable(object):
                         'subreddit_slow', '_deleted', '_spam',
                         'cachable', 'make_permalink', 'permalink',
                         'timesince',
+                        'num',  # listings only, replaced by CachedVariable
+                        'rowstyle_cls',  # listings only, replaced by CachedVariable
+                        'upvote_ratio',
+                        'should_incr_counts',
+                        'keep_item',
                         ])
+
+    @classmethod
+    def update_nofollow(cls, user, wrapped):
+        pass
 
     @classmethod
     def add_props(cls, user, wrapped):
@@ -79,11 +90,18 @@ class Printable(object):
 
     @staticmethod
     def wrapped_cache_key(wrapped, style):
-        s = [wrapped._fullname, wrapped._spam, wrapped.reported]
+        s = [wrapped._fullname, wrapped._spam]
+
+        # Printables can contain embedded WrappedUsers, which need to consider
+        # the site and user's flair settings. Add something to the key
+        # indicating there might be flair--we haven't built the WrappedUser yet
+        # so we can't check to see if there's actually flair.
+        if c.site.flair_enabled and c.user.pref_show_flair:
+            s.append('user_flair_enabled')
 
         if style == 'htmllite':
             s.extend([c.bgcolor, c.bordercolor, 
-                      request.get.has_key('style'),
-                      request.get.get("expanded"), 
+                      request.GET.has_key('style'),
+                      request.GET.get("expanded"),
                       getattr(wrapped, 'embed_voting_style', None)])
         return s

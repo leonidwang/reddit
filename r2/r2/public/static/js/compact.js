@@ -1,27 +1,5 @@
 /*This hides the url bar on mobile*/
 (function($) {
-    /*
-    Creates an element on the body that works to create a modal box
-    The callback function runs when the cover is clicked
-    Use it, for example, to hide your modal box.
-
-    It is kind of tricky to use on mobile platforms, subject to many odd bugs, likely caused by the way mobile platforms handle z-index
-    */
-    function tool_cover(callback) {
-        var toolcover = $("#toolcover");
-        if (toolcover.length == 0) {
-            $("body").prepend("<div class='cover' id='toolcover'></div>");
-            toolcover = $("#toolcover");
-        }
-        toolcover.css("height", $(document).height())
-                .show().one("click", function() {
-                    $(this).hide();
-                    if (callback) callback();
-                    return false;
-                });
-    }
-
-    ;
     $.fn.show_toolbar = function() {
         var tb = this;
         $(this).show();
@@ -32,9 +10,7 @@
         text = $.unsafe_orig(text);
         if (typeof(text) == "string") {
             /* space compress the result */
-            text = text.replace(/[\s]+/g, " ")
-                    .replace(/> +/g, ">")
-                    .replace(/ +</g, "<");
+            text = r.utils.spaceCompress(text);
         }
         return (text || "");
     }
@@ -52,20 +28,20 @@ $(function() {
         return false;
     });
     //Self text expando
-    $('.expando-button').live('click', function() {
+    $(document).on('click', '.expando-button', function() {
         $(this).toggleClass("expanded");
         $(this).thing().find(".expando").toggle();
         return false;
     });
     //Help expando
-    $('.help-toggle').live('click', function() {
+    $(document).on('click', '.help-toggle', function() {
         $(this).toggleClass("expanded");
         $(this).parent().parent().siblings(".markhelp-parent").toggle();
         return false;
     });
 
     //Options expando
-    $('.options_link').live('click', function(evt) {
+    $(document).on('click', '.options_link', function(evt) {
 
         if (! $(this).siblings(".options_expando").hasClass('expanded')) {
             $('.options_expando.expanded').each(function() { //Collapse any other open ones
@@ -83,45 +59,42 @@ $(function() {
         return false;
     });
     //Save button state transition
-    $(".save-button").live("click", function() {
+    $(document).on("click", ".save-button", function() {
         $(this).toggle();
         $(this).siblings(".unsave-button").toggle();
     });
-    $(".unsave-button").live("click", function() {
+    $(document).on("click", ".unsave-button", function() {
         $(this).toggle();
         $(this).siblings(".save-button").toggle();
     });
     //Hide options when we collapse
-    $('.options_expando .collapse-button').live("click", function() {
+    $(document).on("click", '.options_expando .collapse-button', function() {
         $(this).parent().removeClass('expanded');
         $(this).parent().parent().parent().addClass("collapsed");
         $(this).parent().siblings('.options_link').removeClass("active");
     });
     //Collapse when we click reply, or edit
-    $('.reply-button, .edit-button').live("click", function() {
+    $(document).on("click", '.reply-button, .edit-button', function() {
         $(this).parent().siblings('.options-link').click();
     });
-    /* the iphone doesn't play nice with live() unless there is already a registered click function.  That's sad */
-    $(".thing").click(function() {
-    });
 
-    $(".link").live("click", function(evt) {
+    $(document).on("click", ".link", function(evt) {
         if (evt && evt.target && $(evt.target).hasClass("thing")) {
             $(this).find(".options_link").click();
             return false;
         }
     });
     //Comment options
-    $(".comment.collapsed").live("click", function(e) {
+    $(document).on("click", ".comment.collapsed", function(e) {
         $(this).removeClass("collapsed");
     });
-    $(".message.unread").live("click", function(e) {
+    $(document).on("click", ".message.unread", function(e) {
         var thing = $(this)
         read_thing(thing);
         return false;
     });
     /*Finally*/
-    $('a[href=#]').live('click', function() {
+    $(document).on('click', 'a[href=#]', function() {
         return false;
     });
 });
@@ -134,19 +107,6 @@ $(function() {
     };
 
 });
-
-function showcover() {
-    $.request("new_captcha");
-    $(".login-popup:first").fadeIn()
-            .find(".popup").css("top", $(window).scrollTop() + 75).end()
-            .find(".cover").css("height", $(document).height()).end()
-    return false;
-}
-
-function hidecover(where) {
-    $(where).parents(".cover-overlay").fadeOut();
-    return false;
-}
 
 function show_edit_usertext(form) {
     var edit = form.find(".usertext-edit");
@@ -193,3 +153,23 @@ function fetch_more() {
         }
     });
 }
+
+$(function() {
+    if (!!store.safeGet('mobile-web-redirect-opted')) {
+        return;
+    }
+
+    var $bar = $('.mobile-web-redirect-bar');
+
+    $bar.find('.mobile-web-redirect-optin').on('click', function() {
+        store.safeSet('mobile-web-redirect-opted', true);
+    });
+
+    $bar.find('.mobile-web-redirect-optout').on('click', function(e) {
+        e.preventDefault();
+        store.safeSet('mobile-web-redirect-opted', true);
+        $bar.fadeOut();
+    });
+
+    $bar.show();
+});

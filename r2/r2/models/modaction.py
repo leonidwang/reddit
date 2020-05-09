@@ -16,23 +16,25 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from datetime import timedelta
 import itertools
+from uuid import UUID
+
+from pycassa.system_manager import TIME_UUID_TYPE
+from pylons import request
+from pylons import tmpl_context as c
+from pylons import app_globals as g
+from pylons.i18n import _
 
 from r2.lib.db import tdb_cassandra
 from r2.lib.utils import tup
-from r2.models import Account, Subreddit, Link, Comment, Printable
-from r2.models.subreddit import DefaultSR
-from pycassa.system_manager import TIME_UUID_TYPE
-from uuid import UUID
-from pylons.i18n import _
-from pylons import request
 
-class ModAction(tdb_cassandra.UuidThing, Printable):
+
+class ModAction(tdb_cassandra.UuidThing):
     """
     Columns:
     sr_id - Subreddit id36
@@ -46,6 +48,7 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
     _read_consistency_level = tdb_cassandra.CL.ONE
     _use_db = True
     _connection_pool = 'main'
+    _ttl = timedelta(days=120)
     _str_props = ('sr_id36', 'mod_id36', 'target_fullname', 'action', 'details', 
                   'description')
     _defaults = {}
@@ -54,10 +57,13 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
                'removecomment', 'approvecomment', 'addmoderator',
                'invitemoderator', 'uninvitemoderator', 'acceptmoderatorinvite',
                'removemoderator', 'addcontributor', 'removecontributor',
-               'editsettings', 'editflair', 'distinguish', 'marknsfw', 
-               'wikibanned', 'wikicontributor', 'wikiunbanned',
+               'editsettings', 'editflair', 'distinguish', 'marknsfw',
+               'wikibanned', 'wikicontributor', 'wikiunbanned', 'wikipagelisted',
                'removewikicontributor', 'wikirevise', 'wikipermlevel',
-               'ignorereports', 'unignorereports', 'setpermissions')
+               'ignorereports', 'unignorereports', 'setpermissions',
+               'setsuggestedsort', 'sticky', 'unsticky', 'setcontestmode',
+               'unsetcontestmode', 'lock', 'unlock', 'muteuser', 'unmuteuser',
+               'createrule', 'editrule', 'deleterule')
 
     _menu = {'banuser': _('ban user'),
              'unbanuser': _('unban user'),
@@ -79,12 +85,26 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
              'wikibanned': _('ban from wiki'),
              'wikiunbanned': _('unban from wiki'),
              'wikicontributor': _('add wiki contributor'),
+             'wikipagelisted': _('delist/relist wiki pages'),
              'removewikicontributor': _('remove wiki contributor'),
              'wikirevise': _('wiki revise page'),
              'wikipermlevel': _('wiki page permissions'),
              'ignorereports': _('ignore reports'),
              'unignorereports': _('unignore reports'),
-             'setpermissions': _('permissions')}
+             'setpermissions': _('permissions'),
+             'setsuggestedsort': _('set suggested sort'),
+             'sticky': _('sticky post'),
+             'unsticky': _('unsticky post'),
+             'setcontestmode': _('set contest mode'),
+             'unsetcontestmode': _('unset contest mode'),
+             'lock': _('lock post'),
+             'unlock': _('unlock post'),
+             'muteuser': _('mute user'),
+             'unmuteuser': _('unmute user'),
+             'createrule': _('create rule'),
+             'editrule': _('edit rule'),
+             'deleterule': _('delete rule'),
+            }
 
     _text = {'banuser': _('banned'),
              'wikibanned': _('wiki banned'),
@@ -107,11 +127,25 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
              'editflair': _('edited flair'),
              'wikirevise': _('edited wiki page'),
              'wikipermlevel': _('changed wiki page permission level'),
+             'wikipagelisted': _('changed wiki page listing preference'),
              'distinguish': _('distinguished'),
              'marknsfw': _('marked nsfw'),
              'ignorereports': _('ignored reports'),
              'unignorereports': _('unignored reports'),
-             'setpermissions': _('changed permissions on')}
+             'setpermissions': _('changed permissions on'),
+             'setsuggestedsort': _('set suggested sort'),
+             'sticky': _('stickied'),
+             'unsticky': _('unstickied'),
+             'setcontestmode': _('set contest mode on'),
+             'unsetcontestmode': _('unset contest mode on'),
+             'lock': _('locked'),
+             'unlock': _('unlocked'),
+             'muteuser': _('muted'),
+             'unmuteuser': _('unmuted'),
+             'createrule': _('created rule'),
+             'editrule': _('edited rule'),
+             'deleterule': _('deleted rule'),
+            }
 
     _details_text = {# approve comment/link
                      'unspam': _('unspam'),
@@ -133,9 +167,10 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
                      'submit_text_label': _('submit text post button label'),
                      'comment_score_hide_mins': _('comment score hide period'),
                      'over_18': _('toggle viewers must be over 18'),
-                     'allow_top': _('toggle allow in default set'),
+                     'allow_top': _('toggle allow in default/trending lists'),
                      'show_media': _('toggle show thumbnail images of content'),
                      'public_traffic': _('toggle public traffic stats page'),
+                     'collapse_deleted_comments': _('toggle collapse deleted/removed comments'),
                      'exclude_banned_modqueue': _('toggle exclude banned users\' posts from modqueue'),
                      'domain': _('domain'),
                      'show_cname_sidebar': _('toggle show sidebar from cname'),
@@ -144,7 +179,11 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
                      'stylesheet': _('stylesheet'),
                      'del_header': _('delete header image'),
                      'del_image': _('delete image'),
+                     'del_icon': _('delete icon image'),
+                     'del_banner': _('delete banner image'),
                      'upload_image_header': _('upload header image'),
+                     'upload_image_icon': _('upload icon image'),
+                     'upload_image_banner': _('upload banner image'),
                      'upload_image': _('upload image'),
                      # editflair
                      'flair_edit': _('add/edit flair'),
@@ -165,47 +204,19 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
                      'permission_moderator': _('set permissions on moderator'),
                      'permission_moderator_invite': _('set permissions on moderator invitation')}
 
-    # This stuff won't change
-    cache_ignore = set(['subreddit', 'target', 'mod', 'button']).union(Printable.cache_ignore)
-
-    # Thing properties for Printable
-    @property
-    def author_id(self):
-        return int(self.mod_id36, 36)
-
-    @property
-    def sr_id(self):
-        return int(self.sr_id36, 36)
-
-    @property
-    def _ups(self):
-        return 0
-
-    @property
-    def _downs(self):
-        return 0
-
-    @property
-    def _deleted(self):
-        return False
-
-    @property
-    def _spam(self):
-        return False
-
-    @property
-    def reported(self):
-        return False
+    # NOTE: Wrapped ModAction objects are not cachable because wrapped_cache_key
+    # is not defined
 
     @classmethod
     def create(cls, sr, mod, action, details=None, target=None, description=None):
-        # Split this off into separate function to check for valid actions?
+        from r2.models import DefaultSR
+
         if not action in cls.actions:
             raise ValueError("Invalid ModAction: %s" % action)
-        
+
         # Front page should insert modactions into the base sr
         sr = sr._base if isinstance(sr, DefaultSR) else sr
-        
+
         kw = dict(sr_id36=sr._id36, mod_id36=mod._id36, action=action)
 
         if target:
@@ -217,6 +228,16 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
 
         ma = cls(**kw)
         ma._commit()
+
+        g.events.mod_event(
+            modaction=ma,
+            subreddit=sr,
+            mod=mod,
+            target=target,
+            request=request if c.user_is_loggedin else None,
+            context=c if c.user_is_loggedin else None,
+        )
+
         return ma
 
     def _on_create(self):
@@ -224,7 +245,8 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
         Update all Views.
         """
 
-        views = (ModActionBySR, ModActionBySRMod, ModActionBySRAction)
+        views = (ModActionBySR, ModActionBySRMod, ModActionBySRAction, 
+                 ModActionBySRActionMod)
 
         for v in views:
             v.add_object(self)
@@ -248,117 +270,119 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
         if not mod and not action:
             rowkeys = [sr._id36 for sr in srs]
             q = ModActionBySR.query(rowkeys, after=after, reverse=reverse, count=count)
-        elif mod and not action:
+        elif mod:
             mods = tup(mod)
+            key = '%s_%s' if not action else '%%s_%%s_%s' % action
             rowkeys = itertools.product([sr._id36 for sr in srs],
                 [mod._id36 for mod in mods])
-            rowkeys = ['%s_%s' % (sr, mod) for sr, mod in rowkeys]
-            q = ModActionBySRMod.query(rowkeys, after=after, reverse=reverse, count=count)
-        elif not mod and action:
+            rowkeys = [key % (sr, mod) for sr, mod in rowkeys]
+            view = ModActionBySRActionMod if action else ModActionBySRMod
+            q = view.query(rowkeys, after=after, reverse=reverse, count=count)
+        else:
             rowkeys = ['%s_%s' % (sr._id36, action) for sr in srs]
             q = ModActionBySRAction.query(rowkeys, after=after, reverse=reverse, count=count)
-        else:
-            raise NotImplementedError("Can't query by both mod and action")
 
         return q
 
-    def get_extra_text(self):
-        text = ''
-        if hasattr(self, 'details') and not self.details == None:
+    @property
+    def details_text(self):
+        text = ""
+        if getattr(self, "details", None):
             text += self._details_text.get(self.details, self.details)
-        if hasattr(self, 'description') and not self.description == None:
-            text += ' %s' % self.description
+        if getattr(self, "description", None):
+            if text:
+                text += ": "
+            text += self.description
         return text
-
-    @staticmethod
-    def get_rgb(i, fade=0.8):
-        r = int(256 - (hash(str(i)) % 256)*(1-fade))
-        g = int(256 - (hash(str(i) + ' ') % 256)*(1-fade))
-        b = int(256 - (hash(str(i) + '  ') % 256)*(1-fade))
-        return (r, g, b)
 
     @classmethod
     def add_props(cls, user, wrapped):
-
-        from r2.lib.menus import NavButton
         from r2.lib.db.thing import Thing
+        from r2.lib.menus import QueryButton
         from r2.lib.pages import WrappedUser
-        from r2.lib.filters import _force_unicode
+        from r2.models import (
+            Account,
+            Link,
+            ModSR,
+            MultiReddit,
+            Subreddit,
+        )
 
-        TITLE_MAX_WIDTH = 50
+        target_names = {item.target_fullname for item in wrapped
+                            if hasattr(item, "target_fullname")}
+        targets = Thing._by_fullname(target_names, data=True)
 
-        request_path = request.path
+        # get moderators
+        moderators = Account._byID36({item.mod_id36 for item in wrapped},
+                                     data=True)
 
-        target_fullnames = [item.target_fullname for item in wrapped if hasattr(item, 'target_fullname')]
-        targets = Thing._by_fullname(target_fullnames, data=True)
-        authors = Account._byID([t.author_id for t in targets.values() if hasattr(t, 'author_id')], data=True)
-        links = Link._byID([t.link_id for t in targets.values() if hasattr(t, 'link_id')], data=True)
+        # get authors for targets that are Links or Comments
+        target_author_names = {target.author_id for target in targets.values()
+                                    if hasattr(target, "author_id")}
+        target_authors = Account._byID(target_author_names, data=True)
 
-        sr_ids = set([t.sr_id for t in targets.itervalues() if hasattr(t, 'sr_id')] +
-                     [w.sr_id for w in wrapped])
-        subreddits = Subreddit._byID(sr_ids, data=True)
+        # get parent links for targets that are Comments
+        parent_link_names = {target.link_id for target in targets.values()
+                                    if hasattr(target, "link_id")}
+        parent_links = Link._byID(parent_link_names, data=True)
 
-        # Assemble target links
-        target_links = {}
-        target_accounts = {}
-        for fullname, target in targets.iteritems():
-            if isinstance(target, Link):
-                author = authors[target.author_id]
-                title = _force_unicode(target.title)
-                if len(title) > TITLE_MAX_WIDTH:
-                    short_title = title[:TITLE_MAX_WIDTH] + '...'
-                else:
-                    short_title = title
-                text = '%(link)s "%(title)s" %(by)s %(author)s' % {
-                        'link': _('link'),
-                        'title': short_title, 
-                        'by': _('by'),
-                        'author': author.name}
-                path = target.make_permalink(subreddits[target.sr_id])
-                target_links[fullname] = (text, path, title)
-            elif isinstance(target, Comment):
-                author = authors[target.author_id]
-                link = links[target.link_id]
-                title = _force_unicode(link.title)
-                if len(title) > TITLE_MAX_WIDTH:
-                    short_title = title[:TITLE_MAX_WIDTH] + '...'
-                else:
-                    short_title = title
-                text = '%(comment)s %(by)s %(author)s %(on)s "%(title)s"' % {
-                        'comment': _('comment'),
-                        'by': _('by'),
-                        'author': author.name,
-                        'on': _('on'),
-                        'title': short_title}
-                path = target.make_permalink(link, subreddits[link.sr_id])
-                target_links[fullname] = (text, path, title)
-            elif isinstance(target, Account):
-                target_accounts[fullname] = WrappedUser(target)
+        # get subreddits
+        srs = Subreddit._byID36({item.sr_id36 for item in wrapped}, data=True)
 
         for item in wrapped:
-            # Can I move these buttons somewhere else? Not great to have request stuff in here
-            css_class = 'modactions %s' % item.action
-            item.button = NavButton('', item.action, opt='type', css_class=css_class)
-            item.button.build(base_path=request_path)
+            item.moderator = moderators[item.mod_id36]
+            item.subreddit = srs[item.sr_id36]
+            item.text = cls._text.get(item.action, '')
+            item.target = None
+            item.target_author = None
 
-            mod_name = item.author.name
-            item.mod = NavButton(mod_name, mod_name, opt='mod')
-            item.mod.build(base_path=request_path)
-            item.text = ModAction._text.get(item.action, '')
-            item.details = item.get_extra_text()
+            if hasattr(item, "target_fullname") and item.target_fullname:
+                item.target = targets[item.target_fullname]
 
-            if hasattr(item, 'target_fullname') and item.target_fullname:
-                target = targets[item.target_fullname]
-                if isinstance(target, Account):
-                    item.target_wrapped_user = target_accounts[item.target_fullname]
-                elif isinstance(target, Link) or isinstance(target, Comment):
-                    item.target_text, item.target_path, item.target_title = target_links[item.target_fullname]
+                if hasattr(item.target, "author_id"):
+                    author_name = item.target.author_id
+                    item.target_author = target_authors[author_name]
 
-            item.bgcolor = ModAction.get_rgb(item.sr_id)
-            item.sr_name = subreddits[item.sr_id].name
-            item.sr_path = subreddits[item.sr_id].path
+                if hasattr(item.target, "link_id"):
+                    parent_link_name = item.target.link_id
+                    item.parent_link = parent_links[parent_link_name]
 
-        Printable.add_props(user, wrapped)
+                if isinstance(item.target, Account):
+                    item.target_author = item.target
+
+        if c.render_style == "html":
+            request_path = request.path
+
+            # make wrapped users for targets that are accounts
+            user_targets = filter(lambda target: isinstance(target, Account),
+                                  targets.values())
+            wrapped_user_targets = {user._fullname: WrappedUser(user)
+                                    for user in user_targets}
+
+            for item in wrapped:
+                if isinstance(item.target, Account):
+                    user_name = item.target._fullname
+                    item.wrapped_user_target = wrapped_user_targets[user_name]
+
+                css_class = 'modactions %s' % item.action
+                action_button = QueryButton(
+                    '', item.action, query_param='type', css_class=css_class)
+                action_button.build(base_path=request_path)
+                item.action_button = action_button
+
+                mod_button = QueryButton(
+                    item.moderator.name, item.moderator.name, query_param='mod')
+                mod_button.build(base_path=request_path)
+                item.mod_button = mod_button
+
+                if isinstance(c.site, ModSR) or isinstance(c.site, MultiReddit):
+                    rgb = item.subreddit.get_rgb()
+                    item.bgcolor = 'rgb(%s,%s,%s)' % rgb
+                    item.is_multi = True
+                else:
+                    item.bgcolor = "rgb(255,255,255)"
+                    item.is_multi = False
+
 
 class ModActionBySR(tdb_cassandra.View):
     _use_db = True
@@ -383,6 +407,18 @@ class ModActionBySRMod(tdb_cassandra.View):
     @classmethod
     def _rowkey(cls, ma):
         return '%s_%s' % (ma.sr_id36, ma.mod_id36)
+
+class ModActionBySRActionMod(tdb_cassandra.View):
+    _use_db = True
+    _connection_pool = 'main'
+    _compare_with = TIME_UUID_TYPE
+    _view_of = ModAction
+    _ttl = timedelta(days=90)
+    _read_consistency_level = tdb_cassandra.CL.ONE
+
+    @classmethod
+    def _rowkey(cls, ma):
+        return '%s_%s_%s' % (ma.sr_id36, ma.mod_id36, ma.action)
 
 class ModActionBySRAction(tdb_cassandra.View):
     _use_db = True

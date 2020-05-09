@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -118,12 +118,12 @@ def timeago(str interval):
 
     [num] second|minute|hour|day|week|month|year(s)
     """
-    from pylons import g
+    from pylons import app_globals as g
     return datetime.now(g.tz) - timeinterval_fromstr(interval)
 
 def timefromnow(interval):
     "The opposite of timeago"
-    from pylons import g
+    from pylons import app_globals as g
     return datetime.now(g.tz) + timeinterval_fromstr(interval)
 
 def timedelta_by_name(interval):
@@ -181,7 +181,8 @@ cdef timetext(delta, precision=None, bare=True):
     """
     delta = max(delta, timedelta(0))
     cdef long since = delta.days * 24 * 60 * 60 + delta.seconds
-    cdef int i, seconds, count, count2, n
+    cdef long count
+    cdef int i, seconds, n
     cdef TimeText name, name2
 
     for i, (seconds, name) in enumerate(timechunks):
@@ -217,11 +218,11 @@ cdef timetext(delta, precision=None, bare=True):
     return s
 
 def timesince(d, precision=None):
-    from pylons import g
+    from pylons import app_globals as g
     return timetext(datetime.now(g.tz) - d, precision)
 
 def timeuntil(d, precision=None):
-    from pylons import g
+    from pylons import app_globals as g
     return timetext(d - datetime.now(g.tz), precision)
 
 cpdef dict keymap(keys, callfn, mapfn = None, str prefix=''):

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -44,6 +44,8 @@ def load_controllers():
     from listingcontroller import NewController
     from listingcontroller import RisingController
     from listingcontroller import BrowseController
+    from listingcontroller import AdsController
+    from listingcontroller import UserListListingController
     from listingcontroller import MessageController
     from listingcontroller import RedditsController
     from listingcontroller import ByIDController
@@ -54,7 +56,7 @@ def load_controllers():
 
     from listingcontroller import MyredditsController
 
-    from feedback import FeedbackController
+    from admin import AdminToolController
     from front import FormsController
     from front import FrontController
     from health import HealthController
@@ -65,26 +67,38 @@ def load_controllers():
     from post import PostController
     from toolbar import ToolbarController
     from awards import AwardsController
-    from errorlog import ErrorlogController
+    from newsletter import NewsletterController
+    from googletagmanager import GoogleTagManagerController
     from promotecontroller import PromoteController
+    from promotecontroller import SponsorController
+    from promotecontroller import PromoteApiController
+    from promotecontroller import PromoteListingController
+    from promotecontroller import SponsorListingController
     from mediaembed import MediaembedController
     from mediaembed import AdController
+    from oembed import OEmbedController
     from policies import PoliciesController
-    
+    from web import WebLogController
+
     from wiki import WikiController
     from wiki import WikiApiController
 
     from api import ApiController
     from api import ApiminimalController
     from api_docs import ApidocsController
-    from apiv1 import APIv1Controller
+    from apiv1.user import APIv1UserController
+    from apiv1.login import APIv1LoginController
+    from apiv1.gold import APIv1GoldController
+    from apiv1.scopes import APIv1ScopesController
     from multi import MultiApiController
     from oauth2 import OAuth2FrontendController
     from oauth2 import OAuth2AccessController
     from redirect import RedirectController
+    from robots import RobotsController
     from ipn import IpnController
     from ipn import StripeController
     from ipn import CoinbaseController
     from ipn import RedditGiftsController
+    from mailgun import MailgunWebhookController
 
     _reddit_controllers.update((name.lower(), obj) for name, obj in locals().iteritems())

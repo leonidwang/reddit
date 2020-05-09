@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -41,30 +41,22 @@ else
 $(error $(DEFS_PY) failed. aborting)
 endif
 
-#################### Cython
+#################### Generated code: Cython + Thrift
 PYX_FILES := $(shell find . -name \*.pyx)
 PYX_C_FILES := $(PYX_FILES:.pyx=.c)
 PYX_SO_FILES := $(PYX_FILES:.pyx=.so)
-PYX_BUILDSTAMP := $(BUILD_DIR)/pyx-buildstamp
 
-.PHONY: clean_pyx
+.PHONY: pyx clean_pyx
 
-pyx: $(PYX_BUILDSTAMP)
-
-$(PYX_C_FILES): %.c: %.pyx
-	cython $<
-
-# this won't rebuild pyx if you're a jerk and delete a .so file without deleting the buildstamp
-# make clean && make pyx will fix this
-$(PYX_BUILDSTAMP): $(PYX_C_FILES)
-	$(PYTHON) setup.py build_ext --inplace
-	touch $@
+pyx:
+	$(PYTHON) setup.py build
+	$(PYTHON) setup.py build_ext --inplace  # copy the .so files from cython into the source tree
 
 clean_pyx:
-	rm -f $(PYX_BUILDSTAMP) $(PYX_C_FILES) $(PYX_SO_FILES)
+	rm -f $(PYX_C_FILES) $(PYX_SO_FILES)
 
 #################### i18n
-STRINGS_FILE := r2/lib/strings.py
+STRINGS_FILE := r2/lib/generate_strings.py
 GENERATED_STRINGS_FILE := r2/lib/generated_strings.py
 
 .PHONY: i18n clean_i18n
@@ -74,7 +66,7 @@ i18n: $(GENERATED_STRINGS_FILE)
 	$(PYTHON) setup.py extract_messages --input-dirs=r2,$(PLUGIN_I18N_PATHS) -o $(POTFILE)
 
 $(GENERATED_STRINGS_FILE): $(STRINGS_FILE)
-	paster run standalone $(STRINGS_FILE) -c "generate_strings()" > $(GENERATED_STRINGS_FILE)
+	$(PYTHON) $(STRINGS_FILE) > $(GENERATED_STRINGS_FILE)
 
 clean_i18n:
 	rm -f $(GENERATED_STRINGS_FILE)
@@ -94,9 +86,9 @@ clean_ini:
 	rm $(INIFILES)
 
 #################### CSS file lists
-SPRITED_STYLESHEETS += reddit.less compact.css
-LESS_STYLESHEETS := goldinfo.less wiki.less adminbar.less policies.less
-OTHER_STYLESHEETS := reddit-ie6-hax.css reddit-ie7-hax.css mobile.css highlight.css
+SPRITED_STYLESHEETS += reddit.less compact.css modtools.less expando.less
+LESS_STYLESHEETS := wiki.less adminbar.less policies.less reddit-embed.less
+OTHER_STYLESHEETS := mobile.css highlight.css
 
 #################### Static Files
 STATIC_ROOT := r2/public
@@ -135,7 +127,7 @@ endef
 $(foreach plugin,$(PLUGINS),$(eval $(call PLUGIN_STATIC_TEMPLATE,$(plugin))))
 
 #### Stylesheets
-LESSC := r2/lib/contrib/less.js/bin/lessc
+LESSC := lessc
 CSS_COMPRESS := $(PYTHON) r2/lib/contrib/rcssmin.py
 CSS_SOURCE_DIR := $(STATIC_BUILD_DIR)/css
 
@@ -147,9 +139,8 @@ LESS_OUTPUTS := $(addprefix $(STATIC_BUILD_DIR)/, $(patsubst %.less,%.css, $(LES
 MINIFIED_OTHER_STYLESHEETS := $(addprefix $(STATIC_BUILD_DIR)/, $(OTHER_STYLESHEETS))
 
 PROCESSED_STYLESHEETS := $(PROCESSED_SPRITED_STYLESHEETS) $(MINIFIED_OTHER_STYLESHEETS) $(LESS_OUTPUTS)
-RTL_STYLESHEETS := $(PROCESSED_STYLESHEETS:.css=-rtl.css)
 
-CSS_OUTPUTS = $(PROCESSED_STYLESHEETS) $(RTL_STYLESHEETS) $(SPRITES)
+CSS_OUTPUTS = $(PROCESSED_STYLESHEETS) $(SPRITES)
 
 .PHONY: clean_css
 
@@ -172,24 +163,16 @@ $(MINIFIED_OTHER_STYLESHEETS): $(STATIC_BUILD_DIR)/%.css: $(CSS_SOURCE_DIR)/%.cs
 $(STATIC_BUILD_DIR)/sprite-%.png $(STATIC_BUILD_DIR)/%.css: $(CSS_SOURCE_DIR)/%.less $(STATIC_BUILDSTAMP)
 	# see above
 	rm -f $(STATIC_BUILD_DIR)/sprite-$*.png $(STATIC_BUILD_DIR)/$*.css
-	$(PYTHON) r2/lib/nymph.py $(CSS_SOURCE_DIR)/$*.less $(STATIC_BUILD_DIR)/sprite-$*.png > $(STATIC_BUILD_DIR)/$*.less.tmp
-	$(LESSC) $(STATIC_BUILD_DIR)/$*.less.tmp > $(STATIC_BUILD_DIR)/$*.css.tmp
+	$(PYTHON) r2/lib/nymph.py $(CSS_SOURCE_DIR)/$*.less $(STATIC_BUILD_DIR)/sprite-$*.png > $(CSS_SOURCE_DIR)/$*.less.tmp
+	$(LESSC) $(CSS_SOURCE_DIR)/$*.less.tmp > $(STATIC_BUILD_DIR)/$*.css.tmp
 	$(CSS_COMPRESS) < $(STATIC_BUILD_DIR)/$*.css.tmp > $(STATIC_BUILD_DIR)/$*.css
-	rm $(STATIC_BUILD_DIR)/$*.less.tmp $(STATIC_BUILD_DIR)/$*.css.tmp
+	rm $(CSS_SOURCE_DIR)/$*.less.tmp $(STATIC_BUILD_DIR)/$*.css.tmp
 
 # deprecated; remove once compact.scss has been converted to LESS
 $(STATIC_BUILD_DIR)/sprite-%.png $(STATIC_BUILD_DIR)/%.css: $(CSS_SOURCE_DIR)/%.css $(STATIC_BUILDSTAMP)
 	# see above
 	rm -f $(STATIC_BUILD_DIR)/sprite-$*.png $(STATIC_BUILD_DIR)/$*.css
 	$(PYTHON) r2/lib/nymph.py $< $(STATIC_BUILD_DIR)/sprite-$*.png | $(CSS_COMPRESS) > $(STATIC_BUILD_DIR)/$*.css
-
-$(RTL_STYLESHEETS): %-rtl.css : %.css
-	# see above
-	rm -f $@
-	$(SED) -e "s/left/>####</g" \
-	   -e "s/right/left/g" \
-	   -e "s/>####</right/g" \
-	   -e "s/\(margin\|padding\):\s*\([^; ]\+\)\s\+\([^; ]\+\)\s\+\([^; ]\+\)\s\+\([^; ]\+\)/\1:\2 \5 \4 \3/g" $< > $@
 
 clean_css:
 	rm -f $(CSS_OUTPUTS)
@@ -204,7 +187,7 @@ define JS_MODULE_TEMPLATE
 $(JS_MODULE_OUTPUTS_$(1)): $(JS_MODULE_DEPS_$(1)) r2/lib/js.py
 	# remove mangled output symlinks, similar to above.
 	rm -f $(JS_MODULE_OUTPUTS_$(1))
-	paster run standalone r2/lib/js.py -c "build_module('$(1)')"
+	$(PYTHON) r2/lib/js.py build_module "$(1)"
 	touch $$@
 endef
 
@@ -230,34 +213,6 @@ $(MANGLE_BUILDSTAMP): $(MANGLEABLE_FILES)
 	touch $@
 
 clean_names:
-	rm -f $(MANGLE_BUILDSTAMP) $(NAMES_FILES) $(MANGLEABLE_FILES) $(MANGLED_FILES)
-
-#### gzip!
-GZIPPABLE := $(filter %.css %.js,$(MANGLED_FILES))
-GZIPPED := $(addsuffix .gzip,$(GZIPPABLE))
-
-.PHONY: clean_gzip
-
-gzip: $(GZIPPED)
-
-$(GZIPPED): %.gzip: %
-	gzip -c $< > $@
-
-clean_gzip:
-	rm -f $(GZIPPED)
+	rm -f $(MANGLE_BUILDSTAMP) $(NAMES_FILE) $(MANGLEABLE_FILES) $(MANGLED_FILES)
 
 $(shell rm -f $(DEFS_FILE))
-
-#################### country list
-COUNTRY_FILE := $(STATIC_BUILD_DIR)/countries.json
-
-countries: $(COUNTRY_FILE)
-
-$(STATIC_BUILD_DIR):
-	mkdir -p $(STATIC_BUILD_DIR)
-
-$(COUNTRY_FILE): $(STATIC_BUILD_DIR)
-	$(PYTHON) r2/lib/countries.py > $(COUNTRY_FILE)
-
-clean_countries:
-	rm -f $(COUNTRY_FILE)
